@@ -284,6 +284,8 @@ export function FileViewer(props: FileViewerProps): JSX.Element {
             onRemoveComment={onRemoveComment}
             onDraftChange={onDraftChange}
             onReference={onReference}
+            externalLineNums={f.externalLineNums}
+            externalLineContents={f.externalLineContents}
           />
         ) : (
           <div class="main-empty"><p>No diff available</p></div>

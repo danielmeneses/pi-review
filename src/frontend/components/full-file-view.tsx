@@ -90,6 +90,7 @@ function parseDiffRows(diff: string): Array<{
       continue;
     }
     if (line.startsWith("--- ") || line.startsWith("+++ ")) continue;
+    if (line.startsWith("\\")) continue; // Skip "\ No newline..." markers
 
     if (line.startsWith("+")) {
       newLineNum++;

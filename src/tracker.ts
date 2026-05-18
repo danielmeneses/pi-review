@@ -63,6 +63,11 @@ export class ChangeTracker {
    * Per-toolCallId flag: whether external changes were detected at tool_call time.
    */
   private externalChangesDetected = new Map<string, boolean>();
+  /**
+   * Per-toolCallId: the fileLastKnown content at the time external changes were detected.
+   * Used to compute per-line external change tracking.
+   */
+  private externalBaselineContents = new Map<string, string>();
 
   constructor(
     private cwd: string,
@@ -392,6 +397,7 @@ export class ChangeTracker {
     this.fileBaselines.clear();
     this.fileLastKnown.clear();
     this.externalChangesDetected.clear();
+    this.externalBaselineContents.clear();
 
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "message") continue;
@@ -442,7 +448,7 @@ export class ChangeTracker {
             return;
           }
           log("tool_call: bash, affected paths:", affectedPaths);
-          const entries: Array<{ path: string; content: string; existed: boolean; hasExternal?: boolean }> = [];
+          const entries: Array<{ path: string; content: string; existed: boolean; hasExternal?: boolean; externalBaseline?: string }> = [];
           for (const relPath of affectedPaths) {
             const absPath = relPath.startsWith("/") ? relPath : join(this.cwd, relPath);
             try {
@@ -450,7 +456,7 @@ export class ChangeTracker {
               // Detect external changes for this specific file
               const lastKnown = this.fileLastKnown.get(absPath);
               const hasExternal = lastKnown !== undefined && lastKnown !== content;
-              entries.push({ path: absPath, content, existed: true, hasExternal });
+              entries.push({ path: absPath, content, existed: true, hasExternal, externalBaseline: hasExternal ? lastKnown : undefined });
               log("tool_call: bash, stored original for", absPath, "length:", content.length, hasExternal ? "EXTERNAL" : "");
             } catch {
               entries.push({ path: absPath, content: "", existed: false, hasExternal: false });
@@ -481,6 +487,8 @@ export class ChangeTracker {
           const lastKnown = this.fileLastKnown.get(absPath);
           if (lastKnown !== undefined && lastKnown !== content) {
             this.externalChangesDetected.set(event.toolCallId, true);
+            // Store the pre-external-change content for per-line tracking
+            this.externalBaselineContents.set(event.toolCallId, lastKnown);
             log("tool_call: EXTERNAL CHANGES detected for", absPath);
           }
         } catch {
@@ -523,7 +531,7 @@ export class ChangeTracker {
       log("tool_result: bash, no original content stored, skipping");
       return;
     }
-    let entries: Array<{ path: string; content: string; existed: boolean; hasExternal?: boolean }>;
+    let entries: Array<{ path: string; content: string; existed: boolean; hasExternal?: boolean; externalBaseline?: string }>;
     try {
       entries = JSON.parse(origEntry.content);
     } catch {
@@ -539,6 +547,7 @@ export class ChangeTracker {
       const originalContent = entry.content;
       const fileExistedAtToolCall = entry.existed;
       const hasExternal = entry.hasExternal ?? false;
+      const externalBaseline = entry.externalBaseline;
       const relPath = relative(this.cwd, absPath);
 
       let currentContent = "";
@@ -573,6 +582,7 @@ export class ChangeTracker {
         toolCallId: event.toolCallId,
         baselineContent: originalContent,
         hasExternalChanges: hasExternal,
+        externalBaselineContent: externalBaseline,
       };
       change.fileExistsAtToolCall = fileExistedAtToolCall;
       this.changes.push(change);
@@ -649,12 +659,14 @@ export class ChangeTracker {
       toolCallId: event.toolCallId,
       baselineContent: originalContent,
       hasExternalChanges: this.externalChangesDetected.get(event.toolCallId) ?? false,
+      externalBaselineContent: this.externalBaselineContents.get(event.toolCallId),
     };
 
     change.fileExistsAtToolCall = fileExistedAtToolCall;
     this.changes.push(change);
     this.originalContents.delete(event.toolCallId);
     this.externalChangesDetected.delete(event.toolCallId);
+    this.externalBaselineContents.delete(event.toolCallId);
 
     // Update last known state for this file
     if (!fileDeleted) {
@@ -768,6 +780,29 @@ export class ChangeTracker {
         ? acceptedBaseline!
         : (firstPending?.baselineContent ?? firstPending?.originalContent ??
            first.baselineContent ?? first.originalContent);
+
+      // Check if any pending change in this cycle had external changes
+      const hasExternal = pending.some(c => c.hasExternalChanges === true);
+
+      // For external changes: use the pre-external-change baseline and compute
+      // which lines were modified externally for per-line marking in the UI.
+      let externalLineNums: number[] = [];
+      let externalLineContents: string[] = [];
+      let effectiveBaseline = baselineContent;
+      if (hasExternal && status === "pending" && firstPending) {
+        const extBaseline = firstPending.externalBaselineContent;
+        if (extBaseline !== undefined) {
+          // Use the pre-external-change baseline so the diff includes both
+          // external and agent changes
+          effectiveBaseline = extBaseline;
+          // Compute external diff to identify externally modified line numbers
+          const extDiff = this.generateDiff(extBaseline, firstPending.baselineContent ?? firstPending.originalContent, relPath);
+          const result = this.extractChangedLineNums(extDiff);
+          externalLineNums = result.lineNums;
+          externalLineContents = result.contents;
+        }
+      }
+
       const fileExisted = first.fileExistsAtToolCall ?? true;
 
       // Read current content
@@ -783,20 +818,17 @@ export class ChangeTracker {
       // For accepted/reverted files: concatenate individual diffs for audit trail.
       let diff: string;
       if (status === "pending") {
-        diff = this.generateDiff(baselineContent, currentContent, relPath);
+        diff = this.generateDiff(effectiveBaseline, currentContent, relPath);
       } else {
         diff = changes.map((c) => c.diff).join("\n");
       }
-
-      // Check if any pending change in this cycle had external changes
-      const hasExternal = pending.some(c => c.hasExternalChanges === true);
 
       fileDiffs.push({
         filePath,
         relativePath: relPath,
         diff,
         blocks: this.parseDiffBlocks(diff),
-        originalContent: baselineContent,
+        originalContent: effectiveBaseline,
         status,
         changeCount: changes.length,
         tools,
@@ -804,6 +836,8 @@ export class ChangeTracker {
         lastChangeTime: allSorted[allSorted.length - 1].timestamp,
         fileExisted,
         hasExternalChanges: hasExternal,
+        externalLineNums,
+        externalLineContents,
       });
     }
 
@@ -865,6 +899,39 @@ export class ChangeTracker {
     }
 
     return blocks;
+  }
+
+  /**
+   * Extract line numbers and content of added/modified lines from a unified diff.
+   * Returns { lineNums, contents } for lines changed externally.
+   */
+  private extractChangedLineNums(diff: string): { lineNums: number[]; contents: string[] } {
+    if (!diff) return { lineNums: [], contents: [] };
+    const lines = diff.split("\n");
+    let newLineNum = 0;
+    const lineNums: number[] = [];
+    const contents: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("@@")) {
+        const plusIdx = line.indexOf(" +");
+        if (plusIdx !== -1) {
+          const plusPart = line.substring(plusIdx + 2).split(" ")[0];
+          const plusNum = parseInt(plusPart.split(",")[0], 10);
+          if (!isNaN(plusNum)) newLineNum = plusNum - 1;
+        }
+        continue;
+      }
+      if (line.startsWith("--- ") || line.startsWith("+++ ")) continue;
+      if (line.startsWith("\\")) continue;
+      if (line.startsWith("+")) {
+        newLineNum++;
+        lineNums.push(newLineNum);
+        contents.push(line.slice(1));
+      } else if (line.startsWith(" ")) {
+        newLineNum++;
+      }
+    }
+    return { lineNums, contents };
   }
 
   // ------------------------------------------------------------------
@@ -1064,6 +1131,8 @@ export class ChangeTracker {
         let output = result.stdout;
         output = output.replace(oldFile, `a/${filePath}`);
         output = output.replace(newFile, `b/${filePath}`);
+        // Strip "\ No newline at end of file" markers
+        output = output.replace(/^\\ No newline at end of file\n/gm, "");
         return output;
       }
 

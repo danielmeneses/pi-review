@@ -40,6 +40,11 @@ export interface TrackedChange {
    * between the last agent action and this tool call.
    */
   hasExternalChanges?: boolean;
+  /**
+   * The file content from fileLastKnown at the time external changes were
+   * detected. Used to compute which lines were modified externally.
+   */
+  externalBaselineContent?: string;
 }
 
 /**
@@ -96,6 +101,11 @@ export interface FileDiff {
   /** Whether any of the pending changes in this cycle were preceded by
    * external (user/TUI) modifications to the file. */
   hasExternalChanges: boolean;
+  /** Line numbers in the diff that were modified externally (user/TUI).
+   * Empty if no external changes. */
+  externalLineNums: number[];
+  /** Content snippets of externally added lines, for line-shift-robust matching. */
+  externalLineContents: string[];
 }
 
 /**

@@ -26,6 +26,10 @@ export interface DiffTableProps {
   filePath: string;
   /** File status — used to style rows when accepted/reverted. */
   fileStatus: string;
+  /** Line numbers modified externally (user/TUI). Show icon next to these. */
+  externalLineNums?: number[];
+  /** Content of externally modified lines, for line-shift-robust matching. */
+  externalLineContents?: string[];
   /** All line comments across files. */
   lineComments: LineCommentsStore;
   /** Currently editing comment position, or null. */
@@ -275,6 +279,9 @@ function parseDiffRows(diff: string): Array<{
       rows.push({ type: "ctx", origLineNum, newLineNum, content: line.slice(1), sign: " " });
     } else if (line === "") {
       continue;
+    } else if (line.startsWith("\\")) {
+      // Skip "\ No newline at end of file" markers
+      continue;
     } else {
       rows.push({ type: "ctx", origLineNum, newLineNum, content: line, sign: "" });
     }
@@ -306,7 +313,12 @@ export function DiffTable(props: DiffTableProps): JSX.Element {
     onRemoveComment,
     onDraftChange,
     onReference,
+    externalLineNums,
+    externalLineContents,
   } = props;
+
+  const extLineNums = new Set(externalLineNums ?? []);
+  const extLineContents = new Set(externalLineContents ?? []);
 
   if (!diff) return <div class="main-empty"><p>No diff available</p></div>;
 
@@ -390,6 +402,14 @@ export function DiffTable(props: DiffTableProps): JSX.Element {
           }
         >
           {row.type === "del" ? "" : lineNum}
+          {row.type !== "del" && (extLineNums.has(lineNum) || extLineContents.has(row.content)) ? (
+            <span class="line-external-badge" title="Modified externally (user/TUI)">
+              <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                <circle cx="12" cy="7" r="4" />
+              </svg>
+            </span>
+          ) : null}
         </td>
         <td class="line-sign">{fileStatus === "accepted" ? "✓" : fileStatus === "reverted" ? "✕" : row.sign}</td>
         <td class="line-content">

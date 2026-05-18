@@ -371,6 +371,16 @@ header h1 {
   cursor: help;
 }
 
+.line-external-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: var(--pending);
+  margin-left: 2px;
+  cursor: help;
+  opacity: 0.85;
+}
+
 .sidebar-meta {
   display: flex;
   gap: 6px;

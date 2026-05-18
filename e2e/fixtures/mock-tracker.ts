@@ -87,6 +87,8 @@ export class MockTracker implements TrackerInterface {
         lastChangeTime: fileChanges[fileChanges.length - 1].timestamp,
         fileExisted: first.fileExistsAtToolCall ?? true,
         hasExternalChanges: false,
+        externalLineNums: [],
+        externalLineContents: [],
       });
     }
 
