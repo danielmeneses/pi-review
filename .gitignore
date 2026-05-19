@@ -1,10 +1,6 @@
-.pi-review
-.pi-review-tmp
-dist
 node_modules
 .pi
 .claude
 plans
 test-results
-daniel*
 PLAN.md

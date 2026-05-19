@@ -10,11 +10,13 @@
  * - Revert restores the baseline content from the start of the cycle.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, renameSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { TrackedChange, ChangeState, FileDiff, DiffBlock, AggregatedState, ChangeCycle } from "./types.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { TrackedChange, ChangeState, FileDiff, DiffBlock, AggregatedState, ChangeCycle, ExternalFileChange } from "./types.js";
+import { FileWatcher, type ExternalChangeCallback } from "./watcher.js";
+import { GitignoreMatcher } from "./gitignore.js";
 
 const started = new Date().toISOString();
 
@@ -63,17 +65,60 @@ export class ChangeTracker {
    * Per-toolCallId flag: whether external changes were detected at tool_call time.
    */
   private externalChangesDetected = new Map<string, boolean>();
+  /**
+   * Set of absolute file paths currently being modified by an agent tool.
+   * Used to prevent the file watcher from reporting the agent's own writes
+   * as external changes (race: tool writes, watcher fires before tool_result
+   * updates fileLastKnown).
+   *
+   * Persisted to disk so it survives extension reloads.
+   * Values are timestamps (Date.now()) for stale-entry expiry on load.
+   */
+  private _toolActiveFiles = new Map<string, number>();
 
   constructor(
     private cwd: string,
     private pi: ExtensionAPI,
   ) {
     log("ChangeTracker initialized, cwd:", cwd);
-    this.reviewDir = join(cwd, ".pi-review");
+    this.reviewDir = join(cwd, ".pi", "pi-review");
     this.loadFromDisk();
+
+    // Create the file watcher for detecting external (non-agent) changes
+    this.watcher = new FileWatcher(
+      cwd,
+      this.handleExternalChange.bind(this),
+      (filePath) => this.fileLastKnown.get(filePath),
+      300,
+    );
+
+    // Create the .gitignore matcher for the project
+    this.gitignore = new GitignoreMatcher(cwd);
   }
 
   private reviewDir: string;
+
+  /** The file watcher for detecting external changes. */
+  private watcher: FileWatcher;
+
+  /** The .gitignore matcher for project-scoped filtering. */
+  private gitignore: GitignoreMatcher;
+
+  /**
+   * Tracks line numbers from external changes that were acknowledged.
+   * These persist so the ⚡ icon remains visible in the diff even after
+   * the external change entry is removed.
+   * Map: absolute filePath → Set of 1-based line numbers.
+   */
+  private acknowledgedExternalLines = new Map<string, Set<number>>();
+
+  /**
+   * External change entries — one per detected external modification.
+   * Multiple entries can exist for the same file until accept/revert clears them.
+   */
+  private externalChangesList: ExternalFileChange[] = [];
+  /** Counter for unique external change IDs. */
+  private nextExternalId = 1;
 
   // ------------------------------------------------------------------
   // Query methods
@@ -106,39 +151,238 @@ export class ChangeTracker {
       fileDiffs: this.buildFileDiffs(),
       history: [...this.history],
       rawChanges: this.getChanges(),
+      externalChanges: [...this.externalChangesList],
       nextId: this.nextId,
       nextCycleId: this.nextCycleId,
     };
   }
 
   // ------------------------------------------------------------------
-  // Clear non-pending changes
+  // External change methods
   // ------------------------------------------------------------------
 
   /**
-   * Remove all accepted/reverted changes (non-pending) from the tracker.
-   * Also clears all history entries.
-   * @returns number of changes removed.
+   * Handle a detected file change from the watcher. Checks whether the
+   * change was made by the agent (has a pending TrackedChange) — if so
+   * it's skipped. Only truly external changes are recorded.
    */
+  private handleExternalChange: ExternalChangeCallback = (
+    filePath: string,
+    currentContent: string,
+    lastKnownContent: string,
+    relPath: string,
+  ) => {
+    // Safety check: skip files outside project or matching .gitignore
+    if (!this.shouldTrack(filePath)) {
+      log("handleExternalChange: path not tracked, skipping:", relPath);
+      return;
+    }
+
+    // Skip files currently being written by an agent tool — the agent's
+    // own writes would otherwise be detected as spurious external changes
+    // when the watcher fires before tool_result updates fileLastKnown.
+    if (this._toolActiveFiles.has(filePath)) {
+      log("handleExternalChange: agent tool is modifying this file, skipping:", relPath);
+      return;
+    }
+
+    // Log a notice when the file also has pending agent changes — the user
+    // is manually editing a file the agent is working on.
+    if (this.changes.some(c => c.filePath === filePath && c.status === "pending")) {
+      log("handleExternalChange: external edit detected on file with pending agent changes:", relPath);
+    }
+
+    const diff = this.generateDiff(lastKnownContent, currentContent, relPath);
+    const changedLines = this.extractChangedLines(diff);
+
+    if (changedLines.length === 0 && !diff) {
+      log("handleExternalChange: no actual changes for", relPath);
+      return;
+    }
+
+    this.externalChangesList.push({
+      id: `ext-${this.nextExternalId++}`,
+      filePath,
+      relativePath: relPath,
+      changedLines,
+      timestamp: Date.now(),
+      diff,
+    });
+
+    this.fileLastKnown.set(filePath, currentContent);
+    log("handleExternalChange: recorded external change for", relPath, "lines:", changedLines);
+    this.emitUpdate();
+  };
+
+  /**
+   * Parse a unified diff and extract the line numbers (in the new file)
+   * that were added or modified. Returns 1-based line numbers.
+   */
+  private extractChangedLines(diff: string): number[] {
+    if (!diff) return [];
+    const lines = diff.split("\n");
+    const changedLines = new Set<number>();
+    let newLineNum = 0;
+
+    for (const line of lines) {
+      // Hunk header: @@ -start,count +start,count @@
+      const hunkMatch = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)/);
+      if (hunkMatch) {
+        newLineNum = parseInt(hunkMatch[2], 10) - 1;
+        continue;
+      }
+
+      if (line.startsWith("--- ") || line.startsWith("+++ ")) continue;
+
+      if (line.startsWith("+")) {
+        newLineNum++;
+        changedLines.add(newLineNum);
+      } else if (line.startsWith("-")) {
+        // Deletions don't have a line number in the new file
+        continue;
+      } else if (line.startsWith(" ")) {
+        newLineNum++;
+      }
+    }
+
+    return [...changedLines].sort((a, b) => a - b);
+  }
+
+  /**
+   * Get all external changes.
+   */
+  getExternalChanges(): ExternalFileChange[] {
+    return [...this.externalChangesList];
+  }
+
+  /**
+   * Acknowledge and remove external changes for a specific file.
+   * Also updates the file baseline to the current content so future
+   * diffs start from the correct state (including the external edits).
+   */
+  acknowledgeExternalChanges(filePath: string): void {
+    const wasRemoved = this.externalChangesList.some(ec => ec.filePath === filePath);
+    if (!wasRemoved) return;
+
+    // Save the changed lines before removing so the ⚡ icons stay visible
+    const changedLines = this.externalChangesList
+      .filter(ec => ec.filePath === filePath)
+      .flatMap(ec => ec.changedLines);
+    if (changedLines.length > 0) {
+      const existing = this.acknowledgedExternalLines.get(filePath) ?? new Set();
+      for (const ln of changedLines) existing.add(ln);
+      this.acknowledgedExternalLines.set(filePath, existing);
+    }
+
+    this.externalChangesList = this.externalChangesList.filter(c => c.filePath !== filePath);
+
+    // Update baseline to current file content so the external change
+    // is reflected in future diffs.
+    try {
+      const current = readFileSync(filePath, "utf8");
+      this.fileBaselines.set(filePath, current);
+      this.fileLastKnown.set(filePath, current);
+    } catch {
+      this.fileBaselines.delete(filePath);
+      this.fileLastKnown.delete(filePath);
+    }
+    this.emitUpdate();
+  }
+
+  /**
+   * Acknowledge and remove all external changes.
+   */
+  acknowledgeAllExternalChanges(): void {
+    if (this.externalChangesList.length === 0) return;
+
+    // Save all changed lines before clearing
+    for (const ec of this.externalChangesList) {
+      if (ec.changedLines.length > 0) {
+        const existing = this.acknowledgedExternalLines.get(ec.filePath) ?? new Set();
+        for (const ln of ec.changedLines) existing.add(ln);
+        this.acknowledgedExternalLines.set(ec.filePath, existing);
+      }
+    }
+
+    const affectedFiles = new Set(this.externalChangesList.map(ec => ec.filePath));
+    this.externalChangesList = [];
+    for (const filePath of affectedFiles) {
+      try {
+        const current = readFileSync(filePath, "utf8");
+        this.fileBaselines.set(filePath, current);
+        this.fileLastKnown.set(filePath, current);
+      } catch {
+        this.fileBaselines.delete(filePath);
+        this.fileLastKnown.delete(filePath);
+      }
+    }
+    this.emitUpdate();
+  }
+
+  /**
+   * Clear external changes for a specific file (e.g., after accept/revert).
+   */
+  clearExternalChanges(filePath: string): void {
+    const before = this.externalChangesList.length;
+    this.externalChangesList = this.externalChangesList.filter(c => c.filePath !== filePath);
+    if (this.externalChangesList.length !== before) this.emitUpdate();
+  }
+
+  /**
+   * Clear all external changes.
+   */
+  clearAllExternalChanges(): void {
+    if (this.externalChangesList.length > 0) {
+      this.externalChangesList = [];
+      this.emitUpdate();
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Clear non-pending changes
+  // ------------------------------------------------------------------
+
+  /** Remove all non-pending (accepted/reverted) changes, history,
+   *  and all associated per-file state (baselines, last-known, etc.)
+   *  for files that have no remaining changes.
+   *  @returns number of changes removed. */
   clearNonPending(): number {
     const before = this.changes.length;
+    // Determine which files are being fully cleared (no pending changes
+    // remaining — only accepted/reverted entries are being removed).
+    const clearedFiles = new Set<string>();
+    for (const c of this.changes) {
+      if (c.status !== "pending") clearedFiles.add(c.filePath);
+    }
     this.changes = this.changes.filter(c => c.status === "pending");
+    // Remove cleared files from pending set (they may still have pending changes)
+    for (const c of this.changes) clearedFiles.delete(c.filePath);
+
     this.history = [];
+    this.externalChangesList = [];
+    for (const fp of clearedFiles) {
+      this.fileBaselines.delete(fp);
+      this.fileLastKnown.delete(fp);
+      this.acknowledgedExternalLines.delete(fp);
+    }
     this.emitUpdate();
     return before - this.changes.length;
   }
 
-  /**
-   * Remove all non-pending changes for a specific file.
-   * Also clears history entries for this file.
-   * @returns number of changes removed.
-   */
+  /** Remove all non-pending changes and all associated state for a file.
+   *  Clears history, baselines, last-known content, acknowledged external
+   *  lines, and external change entries for this file.
+   *  @returns number of changes removed. */
   clearFile(filePath: string): number {
     const before = this.changes.length;
     this.changes = this.changes.filter(
       c => c.filePath !== filePath || c.status === "pending",
     );
     this.history = this.history.filter(h => h.filePath !== filePath);
+    this.externalChangesList = this.externalChangesList.filter(ec => ec.filePath !== filePath);
+    this.fileBaselines.delete(filePath);
+    this.fileLastKnown.delete(filePath);
+    this.acknowledgedExternalLines.delete(filePath);
     this.emitUpdate();
     return before - this.changes.length;
   }
@@ -219,6 +463,18 @@ export class ChangeTracker {
       this.fileLastKnown.delete(filePath);
     }
 
+    // Move external changed lines to acknowledged set so ⚡ icons persist
+    // after accept — they're absorbed into the new baseline but still visually marked.
+    const extLines = this.externalChangesList
+      .filter(ec => ec.filePath === filePath)
+      .flatMap(ec => ec.changedLines);
+    if (extLines.length > 0) {
+      const existing = this.acknowledgedExternalLines.get(filePath) ?? new Set();
+      for (const ln of extLines) existing.add(ln);
+      this.acknowledgedExternalLines.set(filePath, existing);
+    }
+    this.externalChangesList = this.externalChangesList.filter(ec => ec.filePath !== filePath);
+
     this.emitUpdate();
     return pending.length;
   }
@@ -260,6 +516,10 @@ export class ChangeTracker {
       // Clear the baseline and last known state since file is restored
       this.fileBaselines.delete(filePath);
       this.fileLastKnown.delete(filePath);
+
+      // Clear external changes for this file
+      this.externalChangesList = this.externalChangesList.filter(ec => ec.filePath !== filePath);
+
       this.emitUpdate();
       return pending.length;
     } catch {
@@ -320,6 +580,19 @@ export class ChangeTracker {
       }
     }
 
+    // Move external changed lines to acknowledged set for all accepted files
+    if (count > 0) {
+      const acceptedPaths = new Set(fileGroups.keys());
+      for (const ec of this.externalChangesList) {
+        if (acceptedPaths.has(ec.filePath) && ec.changedLines.length > 0) {
+          const existing = this.acknowledgedExternalLines.get(ec.filePath) ?? new Set();
+          for (const ln of ec.changedLines) existing.add(ln);
+          this.acknowledgedExternalLines.set(ec.filePath, existing);
+        }
+      }
+      this.externalChangesList = this.externalChangesList.filter(ec => !acceptedPaths.has(ec.filePath));
+    }
+
     if (count > 0) this.emitUpdate();
     return count;
   }
@@ -366,6 +639,9 @@ export class ChangeTracker {
 
         this.fileBaselines.delete(filePath);
         this.fileLastKnown.delete(filePath);
+
+        // Clear external changes for this file
+        this.externalChangesList = this.externalChangesList.filter(ec => ec.filePath !== filePath);
       } catch {
         // skip files that can't be reverted
       }
@@ -383,57 +659,6 @@ export class ChangeTracker {
    * Rebuild tracker state from the session history (e.g., on reconnect).
    * Restores all previously tracked changes from session entries.
    */
-  reconstructFromSession(ctx: ExtensionContext): void {
-    // Save disk-loaded state as fallback — reconstructFromSession is called
-    // after loadFromDisk() (constructor) and may clear the in-memory state
-    // before the session history provides changeTracker details.
-    const diskChanges = [...this.changes];
-    const diskHistory = [...this.history];
-    const diskNextId = this.nextId;
-    const diskNextCycleId = this.nextCycleId;
-    const diskBaselines = new Map(this.fileBaselines);
-    const diskLastKnown = new Map(this.fileLastKnown);
-
-    this.changes = [];
-    this.nextId = 1;
-    this.history = [];
-    this.nextCycleId = 1;
-    this.originalContents.clear();
-    this.fileBaselines.clear();
-    this.fileLastKnown.clear();
-    this.externalChangesDetected.clear();
-
-    let foundState = false;
-
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type !== "message") continue;
-      const msg = entry.message;
-      if (msg.role !== "toolResult" || (msg.toolName !== "edit" && msg.toolName !== "write" && msg.toolName !== "bash")) continue;
-
-      const details = msg.details as ChangeTrackerDetails | undefined;
-      if (details?.changeTracker) {
-        const state = details.changeTracker as ChangeState;
-        this.changes = state.changes;
-        this.nextId = state.nextId;
-        if (state.history) this.history = state.history;
-        if (state.nextCycleId) this.nextCycleId = state.nextCycleId;
-        foundState = true;
-      }
-    }
-
-    // Fall back to disk-loaded state if session reconstruction didn't find
-    // any changeTracker details (e.g. fresh session or no tool-result markers).
-    if (!foundState) {
-      this.changes = diskChanges;
-      this.history = diskHistory;
-      this.nextId = diskNextId;
-      this.nextCycleId = diskNextCycleId;
-      this.fileBaselines = diskBaselines;
-      this.fileLastKnown = diskLastKnown;
-      log("reconstructFromSession: no session state found, falling back to disk state (", diskChanges.length, "changes)");
-    }
-  }
-
   // ------------------------------------------------------------------
   // Hook registration
   // ------------------------------------------------------------------
@@ -448,6 +673,10 @@ export class ChangeTracker {
     this.registerToolCallHook();
     this.registerToolResultHook();
     this.registerMessageHook();
+
+    // Start file watcher for detecting external changes
+    this.watcher.start();
+    log("registerHooks: file watcher started");
   }
 
   /**
@@ -470,6 +699,16 @@ export class ChangeTracker {
           const entries: Array<{ path: string; content: string; existed: boolean; hasExternal?: boolean }> = [];
           for (const relPath of affectedPaths) {
             const absPath = relPath.startsWith("/") ? relPath : join(this.cwd, relPath);
+            // Skip files outside the project directory or matching .gitignore
+            if (!this.shouldTrack(absPath)) {
+              log("tool_call: bash path not tracked, skipping:", absPath);
+              continue;
+            }
+            // Cancel pending watcher debounce and mark as agent-active
+            // to prevent spurious external change detections.
+            const rel = absPath.startsWith(this.cwd) ? relative(this.cwd, absPath) : relPath;
+            this.watcher.cancelPending(rel);
+            this._toolActiveFiles.set(absPath, Date.now());
             try {
               const content = readFileSync(absPath, "utf8");
               // Detect external changes for this specific file
@@ -498,6 +737,20 @@ export class ChangeTracker {
 
         const absPath = filePath.startsWith("/") ? filePath : join(this.cwd, filePath);
 
+        // Skip files outside the project directory or matching .gitignore
+        if (!this.shouldTrack(absPath)) {
+          log("tool_call: path not tracked, skipping:", absPath);
+          return;
+        }
+
+        // Cancel any pending watcher debounce for this file — prevents the
+        // agent's own write from being detected as an external change.
+        const relPath = filePath.startsWith(this.cwd) ? relative(this.cwd, absPath) : filePath;
+        this.watcher.cancelPending(relPath);
+        // Mark as being actively modified by the agent to prevent the
+        // watcher from racing with tool_result's fileLastKnown update.
+        this._toolActiveFiles.set(absPath, Date.now());
+
         try {
           const content = readFileSync(absPath, "utf8");
           this.originalContents.set(event.toolCallId, { content, existed: true });
@@ -511,6 +764,7 @@ export class ChangeTracker {
         } catch {
           this.originalContents.set(event.toolCallId, { content: "", existed: false });
           log("tool_call: file not found, marking as new file");
+          // New files: still mark as tool-active until tool_result runs
         }
       } catch (err) {
         log("tool_call: ERROR:", err instanceof Error ? err.stack : String(err));
@@ -561,6 +815,11 @@ export class ChangeTracker {
     let changesAdded = 0;
     for (const entry of entries) {
       const absPath = entry.path;
+      // Safety check: skip files outside the project directory or matching .gitignore
+      if (!this.shouldTrack(absPath)) {
+        log("tool_result: bash path not tracked, skipping:", absPath);
+        continue;
+      }
       const originalContent = entry.content;
       const fileExistedAtToolCall = entry.existed;
       const hasExternal = entry.hasExternal ?? false;
@@ -610,6 +869,9 @@ export class ChangeTracker {
         this.fileLastKnown.delete(absPath);
       }
 
+      // Release the tool-active lock — bash is done modifying this file
+      this._toolActiveFiles.delete(absPath);
+
       log("tool_result: bash, change pushed for", absPath);
     }
 
@@ -621,9 +883,7 @@ export class ChangeTracker {
       }
     }
 
-    return {
-      details: this.mergeDetails(event.details, { changeTracker: this.getState() }),
-    };
+    return event;
   }
 
   /**
@@ -637,6 +897,12 @@ export class ChangeTracker {
     if (!filePath) { log("tool_result: no filePath, skipping"); return; }
 
     const absPath = filePath.startsWith("/") ? filePath : join(this.cwd, filePath);
+    // Safety check: skip files outside the project directory or matching .gitignore
+    if (!this.shouldTrack(absPath)) {
+      log("tool_result: path not tracked, skipping:", absPath);
+      this.originalContents.delete(event.toolCallId);
+      return;
+    }
     const origEntry = this.originalContents.get(event.toolCallId);
     const originalContent = origEntry?.content ?? "";
     const fileExistedAtToolCall = origEntry?.existed ?? false;
@@ -688,6 +954,9 @@ export class ChangeTracker {
       this.fileLastKnown.delete(absPath);
     }
 
+    // Release the tool-active lock — agent is done modifying this file
+    this._toolActiveFiles.delete(absPath);
+
     log("tool_result: change pushed, total:", this.changes.length, "pending:", this.getPendingCount());
 
     this.emitUpdate();
@@ -696,9 +965,7 @@ export class ChangeTracker {
       _ctx.ui.setStatus("pi-review", `${this.getPendingCount()} pending`);
     }
 
-    return {
-      details: this.mergeDetails(event.details, { changeTracker: this.getState() }),
-    };
+    return event;
   }
 
   // ------------------------------------------------------------------
@@ -804,17 +1071,15 @@ export class ChangeTracker {
         currentContent = "";
       }
 
-      // For pending files: generate fresh diff from baseline to current.
-      // For accepted/reverted files: concatenate individual diffs for audit trail.
+      // Generate a fresh diff from original baseline to current content
+      // whenever the file on disk differs from the baseline. This ensures
+      // external changes (detected by watcher or acknowledged) show as hunks.
       let diff: string;
-      if (status === "pending") {
+      if (baselineContent !== currentContent) {
         diff = this.generateDiff(baselineContent, currentContent, relPath);
       } else {
         diff = changes.map((c) => c.diff).join("\n");
       }
-
-      // Check if any pending change in this cycle had external changes
-      const hasExternal = pending.some(c => c.hasExternalChanges === true);
 
       fileDiffs.push({
         filePath,
@@ -828,8 +1093,25 @@ export class ChangeTracker {
         firstChangeTime: allSorted[0].timestamp,
         lastChangeTime: allSorted[allSorted.length - 1].timestamp,
         fileExisted,
-        hasExternalChanges: hasExternal,
       });
+    }
+
+    // --- Second pass: annotate with external change info ---
+    // This is separate from the main loop for clarity. It attaches
+    // external change metadata (⚡ line markers, timestamps) to each
+    // FileDiff, merging both active watcher entries and acknowledged
+    // (historical) external changes.
+    for (const fd of fileDiffs) {
+      const fileExtChanges = this.externalChangesList.filter(ec => ec.filePath === fd.filePath);
+      const currentExtLines = fileExtChanges.flatMap(ec => ec.changedLines);
+      const acknowledgedLines = [...(this.acknowledgedExternalLines.get(fd.filePath) ?? [])];
+      const allExtLines = [...new Set([...currentExtLines, ...acknowledgedLines])].sort((a, b) => a - b);
+      fd.externalChangedLines = allExtLines.length > 0 ? allExtLines : undefined;
+      fd.externalChangeTime = fileExtChanges.length > 0
+        ? Math.max(...fileExtChanges.map(ec => ec.timestamp))
+        : undefined;
+      fd.hasExternalChanges = fd.externalChangedLines !== undefined ||
+        this.changes.some(c => c.filePath === fd.filePath && c.status === "pending" && c.hasExternalChanges);
     }
 
     // Sort: pending first, then by lastChangeTime descending
@@ -1040,6 +1322,32 @@ export class ChangeTracker {
   }
 
   // ------------------------------------------------------------------
+  // Project scope guard
+  // ------------------------------------------------------------------
+
+  /**
+   * Check whether an absolute path is within the project directory.
+   * Files outside the project scope are not tracked for either agent
+   * or external changes.
+   */
+  /**
+   * Check whether a file should be tracked at all.
+   * Returns false if the path is outside the project directory or
+   * matches a .gitignore pattern.
+   */
+  private shouldTrack(absPath: string): boolean {
+    if (!absPath) return false;
+    if (!absPath.startsWith(this.cwd)) return false;
+    if (this.gitignore.isIgnored(absPath)) return false;
+    return true;
+  }
+
+  private isWithinProject(absPath: string): boolean {
+    if (!absPath) return false;
+    return absPath.startsWith(this.cwd);
+  }
+
+  // ------------------------------------------------------------------
   // Diff generation
   // ------------------------------------------------------------------
 
@@ -1068,7 +1376,7 @@ export class ChangeTracker {
 
     // Try unified diff via CLI
     try {
-      const tmpDir = join(this.cwd, ".pi-review-tmp");
+      const tmpDir = join(this.reviewDir, "tmp");
       if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
 
       const oldFile = join(tmpDir, `orig-${Date.now()}`);
@@ -1170,52 +1478,168 @@ export class ChangeTracker {
   // Disk persistence
   // ------------------------------------------------------------------
 
-  /** Save full tracker state to .pi-review/state.json. */
+  /** Save full tracker state to .pi/pi-review/state.json. */
   private saveToDisk(): void {
     try {
       if (!existsSync(this.reviewDir)) mkdirSync(this.reviewDir, { recursive: true });
-      const stateFile = join(this.reviewDir, "state.json");
-      const data = JSON.stringify({
-        changes: this.changes,
-        history: this.history,
+      // Snapshot all in-memory state atomically
+      const snapshot = {
+        changes: [...this.changes],
+        history: [...this.history],
         nextId: this.nextId,
         nextCycleId: this.nextCycleId,
         fileBaselines: Object.fromEntries(this.fileBaselines),
         fileLastKnown: Object.fromEntries(this.fileLastKnown),
-      }, null, 2);
-      writeFileSync(stateFile, data, "utf8");
+        _toolActiveFiles: [...this._toolActiveFiles.entries()],
+        externalChanges: this.externalChangesList,
+        acknowledgedExternalLines: Object.fromEntries(
+          [...this.acknowledgedExternalLines.entries()].map(([k, s]) => [k, [...s]])
+        ),
+      };
+      // Atomically write to a temp file then rename, preventing partial
+      // writes if the process crashes mid-write or the file is read concurrently.
+      const stateFile = join(this.reviewDir, "state.json");
+      const tmpFile = join(this.reviewDir, "state.json.tmp");
+      const data = JSON.stringify(snapshot, null, 2);
+      writeFileSync(tmpFile, data, "utf8");
+      rmSync(stateFile, { force: true });
+      renameSync(tmpFile, stateFile);
     } catch (err) {
       log("saveToDisk: ERROR:", err instanceof Error ? err.message : String(err));
     }
   }
 
-  /** Load tracker state from .pi-review/state.json. */
+  /**
+   * Load tracker state from .pi/pi-review/state.json.
+   *
+   * Persistence contract:
+   *   PERSISTS  → changes, history, counters, fileBaselines, externalChangesList,
+   *               acknowledgedExternalLines
+   *   RESETS    → fileLastKnown is rebuilt from current disk content so the
+   *               watcher only detects changes that happen AFTER reload
+   */
   private loadFromDisk(): void {
-    try {
-      const stateFile = join(this.reviewDir, "state.json");
-      if (!existsSync(stateFile)) return;
-      const raw = readFileSync(stateFile, "utf8");
-      const data = JSON.parse(raw);
-      if (Array.isArray(data.changes)) this.changes = data.changes;
-      if (Array.isArray(data.history)) this.history = data.history;
-      if (typeof data.nextId === "number") this.nextId = data.nextId;
-      if (typeof data.nextCycleId === "number") this.nextCycleId = data.nextCycleId;
-      if (data.fileBaselines) {
-        this.fileBaselines.clear();
-        for (const [k, v] of Object.entries(data.fileBaselines)) {
-          this.fileBaselines.set(k, v as string);
+    const stateFile = join(this.reviewDir, "state.json");
+
+    // Backward-compat: migrate from old .pi-review/ path to .pi/pi-review/
+    if (!existsSync(stateFile)) {
+      const oldStateFile = join(this.cwd, ".pi-review", "state.json");
+      if (existsSync(oldStateFile)) {
+        try {
+          mkdirSync(dirname(stateFile), { recursive: true });
+          renameSync(oldStateFile, stateFile);
+          // Clean up old tmp dir if it exists
+          const oldTmpDir = join(this.cwd, ".pi-review-tmp");
+          if (existsSync(oldTmpDir)) {
+            try { rmSync(oldTmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+          }
+          // Remove old .pi-review dir if empty
+          try { rmSync(dirname(oldStateFile), { force: true }); } catch { /* ignore */ }
+          log("loadFromDisk: migrated state from .pi-review/ to .pi/pi-review/");
+        } catch (err) {
+          log("loadFromDisk: migration failed:", err instanceof Error ? err.message : String(err));
+          return;
         }
+      } else {
+        return;
       }
-      if (data.fileLastKnown) {
-        this.fileLastKnown.clear();
-        for (const [k, v] of Object.entries(data.fileLastKnown)) {
-          this.fileLastKnown.set(k, v as string);
-        }
-      }
-      log("loadFromDisk: loaded", this.changes.length, "changes,", this.history.length, "history entries");
-    } catch (err) {
-      log("loadFromDisk: ERROR:", err instanceof Error ? err.message : String(err));
     }
+
+    let raw: string;
+    try {
+      raw = readFileSync(stateFile, "utf8");
+    } catch {
+      log("loadFromDisk: could not read state file");
+      return;
+    }
+
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      log("loadFromDisk: state file is corrupt JSON, resetting");
+      rmSync(stateFile, { force: true });
+      return;
+    }
+
+    // ── PERSIST across reloads ─────────────────────────────────────
+    // Each section loaded independently — one bad field can't wipe others.
+
+    try { if (Array.isArray(data.changes)) this.changes = data.changes; }
+    catch { log("loadFromDisk: ignoring bad changes"); }
+    try { if (Array.isArray(data.history)) this.history = data.history; }
+    catch { log("loadFromDisk: ignoring bad history"); }
+    try { if (typeof data.nextId === "number") this.nextId = data.nextId; }
+    catch { log("loadFromDisk: ignoring bad nextId"); }
+    try { if (typeof data.nextCycleId === "number") this.nextCycleId = data.nextCycleId; }
+    catch { log("loadFromDisk: ignoring bad nextCycleId"); }
+
+    try {
+      if (data.fileBaselines && typeof data.fileBaselines === "object") {
+        this.fileBaselines.clear();
+        for (const [k, v] of Object.entries(data.fileBaselines as Record<string, unknown>)) {
+          if (typeof v === "string") this.fileBaselines.set(k, v);
+        }
+      }
+    } catch { log("loadFromDisk: ignoring bad fileBaselines"); }
+
+    try {
+      if (data.externalChanges && Array.isArray(data.externalChanges)) {
+        this.externalChangesList = data.externalChanges as ExternalFileChange[];
+        for (const ec of this.externalChangesList) {
+          if (ec.id && ec.id.startsWith("ext-")) {
+            const num = parseInt(ec.id.replace("ext-", ""), 10);
+            if (num >= this.nextExternalId) this.nextExternalId = num + 1;
+          }
+        }
+      }
+    } catch { log("loadFromDisk: ignoring bad externalChanges"); }
+
+    try {
+      if (data.acknowledgedExternalLines && typeof data.acknowledgedExternalLines === "object") {
+        this.acknowledgedExternalLines.clear();
+        for (const [k, lines] of Object.entries(data.acknowledgedExternalLines as Record<string, unknown>)) {
+          if (Array.isArray(lines)) this.acknowledgedExternalLines.set(k, new Set(lines as number[]));
+        }
+      }
+    } catch { log("loadFromDisk: ignoring bad acknowledgedExternalLines"); }
+
+    // Restore agent-tool-active files from persisted state so external
+    // change detection survives extension reloads. Expire entries older
+    // than 60 seconds — they're stale from a crashed/aborted tool call.
+    try {
+      if (data._toolActiveFiles && Array.isArray(data._toolActiveFiles)) {
+        const expiry = Date.now() - 60_000;
+        this._toolActiveFiles.clear();
+        for (const [path, ts] of data._toolActiveFiles as Array<[string, number]>) {
+          if (typeof path === "string" && typeof ts === "number" && ts > expiry) {
+            this._toolActiveFiles.set(path, ts);
+          }
+        }
+      }
+    } catch { log("loadFromDisk: ignoring bad _toolActiveFiles"); }
+
+    // ── RESET on reload ────────────────────────────────────────────
+    // fileLastKnown is rebuilt from current disk content so the watcher
+    // only flags files that change WHILE it's running, not files that
+    // were legitimately modified before the reload.
+    this.fileLastKnown.clear();
+    const allTrackedFiles = new Set([
+      ...this.changes.map(c => c.filePath),
+      ...this.externalChangesList.map(ec => ec.filePath),
+      ...this.acknowledgedExternalLines.keys(),
+    ]);
+    for (const absPath of allTrackedFiles) {
+      try {
+        const current = readFileSync(absPath, "utf8");
+        this.fileLastKnown.set(absPath, current);
+      } catch {
+        // File doesn't exist — skip
+      }
+    }
+
+    log("loadFromDisk: loaded", this.changes.length, "changes,", this.history.length, "history entries, ",
+      this.externalChangesList.length, "external, ", this.acknowledgedExternalLines.size, "ackLines");
   }
 
   /**
@@ -1460,15 +1884,4 @@ export class ChangeTracker {
     return responses;
   }
 
-  /** Merge tracker details into an existing details object. */
-  private mergeDetails(existing: any, tracker: ChangeTrackerDetails): any {
-    if (!existing) return tracker;
-    if (typeof existing !== "object") return tracker;
-    return { ...existing, ...tracker };
-  }
-}
-
-/** Internal details shape attached to tool result messages. */
-interface ChangeTrackerDetails {
-  changeTracker?: ChangeState;
 }

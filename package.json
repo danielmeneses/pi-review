@@ -2,24 +2,34 @@
   "name": "pi-review",
   "type": "module",
   "description": "PI extension to review, accept, and revert agent code changes",
+  "files": [
+    "index.ts",
+    "src",
+    "dist"
+  ],
   "pi": {
     "extensions": [
       "./index.ts"
     ]
   },
   "scripts": {
+    "prepare": "git config core.hooksPath .githooks",
     "build:frontend": "node build.mjs",
     "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui"
+    "test:e2e:ui": "playwright test --ui",
+    "test:unit": "node --import tsx --test tests/*.test.ts",
+    "test": "npm run test:unit"
   },
   "dependencies": {
     "highlight.js": "^11.11.1",
+    "ignore": "^7.0.5",
     "preact": "^10.26.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "latest",
     "@playwright/test": "^1.52.0",
     "esbuild": "^0.25.0",
+    "tsx": "^4.22.3",
     "typescript": "^6.0.3"
   }
 }

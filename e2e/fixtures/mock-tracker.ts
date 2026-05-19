@@ -5,7 +5,7 @@
  * can be tested without the full PI extension runtime.
  */
 
-import type { TrackerInterface, TrackedChange, FileDiff, AggregatedState } from "../../src/types.js";
+import type { TrackerInterface, TrackedChange, FileDiff, AggregatedState, ExternalFileChange } from "../../src/types.js";
 
 /**
  * A simple in-memory tracker for testing the server and UI.
@@ -16,11 +16,25 @@ export class MockTracker implements TrackerInterface {
   private nextId = 1;
   private history: any[] = []; // ChangeCycle[]
   private nextCycleId = 1;
+  private externalChanges: ExternalFileChange[] = [];
+  private nextExternalId = 1;
   private onBroadcast?: () => void;
 
   /** Set a callback invoked when broadcastUpdate is called. */
   setBroadcastCallback(cb: () => void): void {
     this.onBroadcast = cb;
+  }
+
+  /** Seed an external change for testing. */
+  seedExternalChange(partial: Partial<ExternalFileChange> & { filePath: string; relativePath: string }): void {
+    this.externalChanges.push({
+      id: `ext-${this.nextExternalId++}`,
+      filePath: partial.filePath,
+      relativePath: partial.relativePath,
+      changedLines: partial.changedLines ?? [1],
+      timestamp: partial.timestamp ?? Date.now(),
+      diff: partial.diff ?? "",
+    });
   }
 
   /**
@@ -90,10 +104,22 @@ export class MockTracker implements TrackerInterface {
       });
     }
 
+    // Annotate file diffs with external changed lines
+    for (const fd of fileDiffs) {
+      const extLines = this.externalChanges
+        .filter(ec => ec.filePath === fd.filePath)
+        .flatMap(ec => ec.changedLines);
+      if (extLines.length > 0) {
+        fd.externalChangedLines = [...new Set(extLines)].sort((a, b) => a - b);
+        fd.hasExternalChanges = true;
+      }
+    }
+
     return {
       fileDiffs,
       history: this.history,
       rawChanges: this.changes,
+      externalChanges: [...this.externalChanges],
       nextId: this.nextId,
       nextCycleId: this.nextCycleId,
     };
@@ -217,5 +243,33 @@ export class MockTracker implements TrackerInterface {
 
   drainCommentResponses(): Array<{ text: string; timestamp: number }> {
     return [];
+  }
+
+  // ------------------------------------------------------------------
+  // External change methods
+  // ------------------------------------------------------------------
+
+  getExternalChanges(): ExternalFileChange[] {
+    return [...this.externalChanges];
+  }
+
+  acknowledgeExternalChanges(filePath: string): void {
+    this.externalChanges = this.externalChanges.filter(c => c.filePath !== filePath);
+    if (this.onBroadcast) this.onBroadcast();
+  }
+
+  acknowledgeAllExternalChanges(): void {
+    this.externalChanges = [];
+    if (this.onBroadcast) this.onBroadcast();
+  }
+
+  clearExternalChanges(filePath: string): void {
+    this.externalChanges = this.externalChanges.filter(c => c.filePath !== filePath);
+    if (this.onBroadcast) this.onBroadcast();
+  }
+
+  clearAllExternalChanges(): void {
+    this.externalChanges = [];
+    if (this.onBroadcast) this.onBroadcast();
   }
 }

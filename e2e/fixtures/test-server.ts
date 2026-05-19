@@ -4,6 +4,8 @@
  */
 
 import { test as base } from "@playwright/test";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { dirname } from "node:path";
 import { WebServer } from "../../src/server.js";
 import { MockTracker } from "./mock-tracker.js";
 import type { TrackedChange } from "../../src/types.js";
@@ -45,6 +47,14 @@ export const test = base.extend<Fixtures>({
         baselineContent: "",
       },
     ]);
+
+    // Write seeded files to disk so the full-file content endpoint works
+    for (const c of tracker.getChanges()) {
+      const absPath = c.filePath;
+      const dir = dirname(absPath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(absPath, c.originalContent || "", "utf8");
+    }
 
     await use(port);
 

@@ -8,7 +8,7 @@
 
 import { JSX } from "preact";
 import { useState, useEffect, useCallback, useRef } from "preact/hooks";
-import type { FileDiff, ChangeCycle, AggregatedState } from "../types.js";
+import type { FileDiff, ChangeCycle, AggregatedState, ExternalFileChange } from "../types.js";
 import {
   countTotalComments,
   relativePathFromAbs,
@@ -34,6 +34,9 @@ import {
   type SSEStatus,
   apiClearNonPending,
   apiClearFile,
+  fetchExternalChanges,
+  apiAcknowledgeExternal,
+  apiAcknowledgeAllExternal,
 } from "./store.js";
 import { Header } from "./components/header.js";
 import { Sidebar } from "./components/sidebar.js";
@@ -85,6 +88,9 @@ export function App(): JSX.Element {
   // -- SSE state --
   const [sseStatus, setSseStatus] = useState<SSEStatus>("disconnected");
 
+  // -- External changes state --
+  const [externalChanges, setExternalChanges] = useState<ExternalFileChange[]>([]);
+
   // -- Reference panel state --
   const [refSelection, setRefSelection] = useState<SelectedLines | null>(null);
   const [refMessages, setRefMessages] = useState<ConversationMessage[]>([]);
@@ -130,6 +136,7 @@ export function App(): JSX.Element {
       const state: AggregatedState = await fetchState();
       setFileDiffs(state.fileDiffs || []);
       setHistory(state.history || []);
+      setExternalChanges(state.externalChanges || []);
       setFetchError(null);
 
       // Auto-select first pending file on initial load
@@ -154,6 +161,7 @@ export function App(): JSX.Element {
     if (editingCommentRef.current) return;
     setFileDiffs(data.fileDiffs || []);
     setHistory(data.history || []);
+    setExternalChanges(data.externalChanges || []);
     setFetchError(null);
   }, []);
 
@@ -187,6 +195,19 @@ export function App(): JSX.Element {
       }
     }
   }, [fileDiffs, fullFileView]);
+
+  // When the selected path changes, fetch file content if not already cached.
+  // Also fetch for external-only files (not in fileDiffs but in externalChanges).
+  useEffect(() => {
+    if (!selectedPath) return;
+    const hasAgentChanges = fileDiffs.some(f => f.filePath === selectedPath);
+    const hasExternalChanges = externalChanges.some(ec => ec.filePath === selectedPath);
+    // Always fetch if we have external changes for this file (may be external-only)
+    if (!hasAgentChanges && !hasExternalChanges) return;
+    apiGetFileContent(selectedPath).then((content) => {
+      setFileContents((fc) => ({ ...fc, [selectedPath]: content }));
+    }).catch(() => {});
+  }, [selectedPath, fileDiffs, externalChanges]);
 
   // -----------------------------------------------------------------------
   // SSE connection lifecycle
@@ -643,8 +664,9 @@ export function App(): JSX.Element {
   // Chat handlers
   // -----------------------------------------------------------------------
 
-  const handleOpenChat = useCallback(() => setChatOpen(true), []);
+  const handleToggleChat = useCallback(() => setChatOpen(prev => !prev), []);
   const handleCloseChat = useCallback(() => setChatOpen(false), []);
+  const handleClearChat = useCallback(() => setChatMessages([]), []);
 
   const handleSendChat = useCallback(async () => {
     const msg = chatDraft.trim();
@@ -694,7 +716,7 @@ export function App(): JSX.Element {
     : null;
 
   // Check if we should show the main empty state
-  const hasNoData = fileDiffs.length === 0 && history.length === 0 && !fetchError;
+  const hasNoData = fileDiffs.length === 0 && history.length === 0 && externalChanges.length === 0 && !fetchError;
 
   // -----------------------------------------------------------------------
   // Render
@@ -709,7 +731,7 @@ export function App(): JSX.Element {
         onRevertAll={handleRevertAll}
         onSendComments={handleSendComments}
         onClearComments={handleClearAllComments}
-        onOpenChat={handleOpenChat}
+        onOpenChat={handleToggleChat}
         onRefresh={refresh}
       />
 
@@ -720,6 +742,7 @@ export function App(): JSX.Element {
         <Sidebar
           fileDiffs={fileDiffs}
           history={history}
+          externalChanges={externalChanges}
           selectedPath={selectedPath}
           selectedCycle={selectedCycleId}
           collapsedFiles={collapsedFiles}
@@ -735,6 +758,8 @@ export function App(): JSX.Element {
           onToggleCollapse={handleToggleCollapse}
           onClearFile={handleClearFile}
           onClearHistory={handleClearNonPending}
+          onAcknowledgeExternal={(fp) => apiAcknowledgeExternal(fp)}
+          onAcknowledgeAllExternal={() => apiAcknowledgeAllExternal()}
         />
 
         {/* Resize handle between sidebar and main */}
@@ -784,11 +809,13 @@ export function App(): JSX.Element {
             <FileViewer
               selectedFile={selectedFile}
               selectedCycle={selectedCycle}
+              selectedPath={selectedPath}
               showFullFile={fullFileView[selectedPath || ""] === true}
               fileContent={selectedPath ? fileContents[selectedPath] || null : null}
               lineComments={lineComments}
               editingComment={editingComment}
               editingCommentDraft={editingCommentDraft}
+              externalChanges={externalChanges}
               onAccept={() => selectedPath && handleAcceptFile(selectedPath)}
               onRevert={() => selectedPath && handleRevertFile(selectedPath)}
               onToggleFull={() => selectedPath && handleToggleFullFile(selectedPath)}
@@ -842,6 +869,7 @@ export function App(): JSX.Element {
         onDraftChange={setChatDraft}
         onSend={handleSendChat}
         onClose={handleCloseChat}
+        onClear={handleClearChat}
       />
     </>
   );

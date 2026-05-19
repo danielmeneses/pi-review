@@ -130,6 +130,7 @@ export function ReferencePanel(props: ReferencePanelProps): JSX.Element {
       <div class="reference-panel-input">
         <textarea
           ref={textareaRef}
+          data-gramm="false"
           placeholder={hasStarted ? "Type a follow-up..." : "What would you like to know or change?"}
           value={draft}
           onInput={(e: Event) => onDraftChange((e.target as HTMLTextAreaElement).value)}

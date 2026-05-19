@@ -6,7 +6,7 @@
  * notify subscribers when data changes.
  */
 
-import type { AggregatedState, FileDiff, ChangeCycle } from "../types.js";
+import type { AggregatedState, FileDiff, ChangeCycle, ExternalFileChange } from "../types.js";
 import type { LineCommentsStore, EditingComment } from "./utils.js";
 
 // ---------------------------------------------------------------------------
@@ -124,9 +124,32 @@ export async function apiSendReference(params: {
   return res.json();
 }
 
-/** Open a file in VS Code. */
-export async function apiOpenInEditor(filePath: string): Promise<{ success: boolean }> {
-  const res = await fetch(`/api/open-in-editor/${encodeURIComponent(filePath)}`, { method: "POST" });
+/** Fetch external changes from the server. */
+export async function fetchExternalChanges(): Promise<ExternalFileChange[]> {
+  const res = await fetch("/api/external-changes");
+  if (!res.ok) return [];
+  return res.json();
+}
+
+/** Acknowledge external changes for a specific file. */
+export async function apiAcknowledgeExternal(filePath: string): Promise<{ success: boolean }> {
+  const res = await fetch(`/api/external-changes/acknowledge/${encodeURIComponent(filePath)}`, { method: "POST" });
+  return res.json();
+}
+
+/** Acknowledge all external changes. */
+export async function apiAcknowledgeAllExternal(): Promise<{ success: boolean }> {
+  const res = await fetch("/api/external-changes/acknowledge-all", { method: "POST" });
+  return res.json();
+}
+
+/** Open a file in the specified editor. */
+export async function apiOpenInEditor(filePath: string, editor?: string): Promise<{ success: boolean }> {
+  const res = await fetch(`/api/open-in-editor/${encodeURIComponent(filePath)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ editor: editor ?? "code" }),
+  });
   return res.json();
 }
 

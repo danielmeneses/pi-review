@@ -8,7 +8,7 @@
 
 import { JSX } from "preact";
 import { useState, useEffect } from "preact/hooks";
-import type { FileDiff, ChangeCycle } from "../../types.js";
+import type { FileDiff, ChangeCycle, ExternalFileChange } from "../../types.js";
 import {
   dotClassForStatus,
   formatChangeCount,
@@ -24,6 +24,8 @@ export interface SidebarProps {
   fileDiffs: FileDiff[];
   /** History of accept/revert cycles. */
   history: ChangeCycle[];
+  /** External file changes detected by watcher. */
+  externalChanges: ExternalFileChange[];
   /** Currently selected file path (for current pending view). */
   selectedPath: string | null;
   /** Currently selected history cycle ID (or null for current view). */
@@ -54,6 +56,10 @@ export interface SidebarProps {
   onToggleConversation: () => void;
   /** Number of messages in the conversation (for badge). */
   refMessagesCount: number;
+  /** Called to acknowledge external changes for a file. */
+  onAcknowledgeExternal?: (filePath: string) => void;
+  /** Called to acknowledge (clear) all external changes. */
+  onAcknowledgeAllExternal?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +376,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const {
     fileDiffs,
     history,
+    externalChanges,
     selectedPath,
     selectedCycle,
     collapsedFiles,
@@ -385,6 +392,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     conversationOpen,
     onToggleConversation,
     refMessagesCount,
+    onAcknowledgeExternal,
+    onAcknowledgeAllExternal,
   } = props;
 
   // Build history lookup: filePath -> sorted cycles
@@ -428,7 +437,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           <div class="main-empty">
             <p style="color:var(--diff-del)">{fetchError}</p>
           </div>
-        ) : fileDiffs.length === 0 && history.length === 0 ? (
+        ) : fileDiffs.length === 0 && history.length === 0 && externalChanges.length === 0 ? (
           <div class="main-empty">
             <p>No tracked changes</p>
           </div>
@@ -451,6 +460,85 @@ export function Sidebar(props: SidebarProps): JSX.Element {
                 onSelectCycle={onSelectCycle}
               />
             ))}
+            {/* External changes section — deduplicated by filePath */}
+            {externalChanges.length > 0 && (() => {
+              // Group external changes by filePath, merge timestamps and line counts
+              const grouped = new Map<string, { entries: ExternalFileChange[]; latestTimestamp: number; mergedLines: Set<number> }>();
+              for (const ec of externalChanges) {
+                const g = grouped.get(ec.filePath);
+                if (g) {
+                  g.entries.push(ec);
+                  if (ec.timestamp > g.latestTimestamp) g.latestTimestamp = ec.timestamp;
+                  for (const ln of ec.changedLines) g.mergedLines.add(ln);
+                } else {
+                  grouped.set(ec.filePath, {
+                    entries: [ec],
+                    latestTimestamp: ec.timestamp,
+                    mergedLines: new Set(ec.changedLines),
+                  });
+                }
+              }
+              const groupedList = [...grouped.entries()]
+                .sort(([, a], [, b]) => b.latestTimestamp - a.latestTimestamp);
+              return (
+                <>
+                  <div class="sidebar-section-label">
+                    <span>External Changes</span>
+                    <button
+                      class="sidebar-header-trash"
+                      title="Clear all external changes"
+                      onClick={(e: Event) => {
+                        e.stopPropagation();
+                        onAcknowledgeAllExternal?.();
+                      }}
+                    >
+                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="3 6 5 6 21 6" />
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        <line x1="10" y1="11" x2="10" y2="17" />
+                        <line x1="14" y1="11" x2="14" y2="17" />
+                      </svg>
+                    </button>
+                  </div>
+                  {groupedList.map(([filePath, { entries, latestTimestamp, mergedLines }]) => {
+                    const ec = entries[0]; // first entry for display metadata
+                    const totalLines = mergedLines.size;
+                    const countLabel = entries.length > 1
+                      ? `${entries.length} edits · ${totalLines} line${totalLines !== 1 ? "s" : ""}`
+                      : `${totalLines} line${totalLines !== 1 ? "s" : ""}`;
+                    return (
+                      <div key={filePath} class={`sidebar-item sidebar-external${filePath === selectedPath ? " selected" : ""}`} onClick={() => onSelectFile(filePath)}>
+                        <span class="status-dot dot-external"></span>
+                        <div class="sidebar-item-info">
+                          <div class="sidebar-file-row">
+                            <span class="sidebar-file-path" title={ec.relativePath}>
+                              {ec.relativePath}
+                            </span>
+                          </div>
+                          <div class="sidebar-meta">
+                            <span class="sidebar-tool-badge">external</span>
+                            <span class="sidebar-count">{countLabel} · {formatTime(latestTimestamp)}</span>
+                          </div>
+                        </div>
+                        <div class="sidebar-right">
+                          <button
+                            class="btn-sm btn-sm-ack"
+                            title="Acknowledge external changes"
+                            onClick={(e: Event) => {
+                              e.stopPropagation();
+                              onAcknowledgeExternal?.(filePath);
+                            }}
+                          >
+                            ✓
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
+              );
+            })()}
+
             {/* History-only files (no current pending entry) */}
             {[...historyByFile.keys()]
               .filter((fp) => !filesWithCurrentEntries.has(fp))
@@ -475,21 +563,24 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           </>
         )}
       </div>
-      <div class="sidebar-footer">
-        <button
-          class={`sidebar-conversation-toggle${conversationOpen ? " conv-active" : ""}`}
-          title={conversationOpen ? "Hide conversation" : "Show conversation"}
-          onClick={onToggleConversation}
-        >
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-          </svg>
-          <span>Conversation</span>
-          {refMessagesCount > 0 && (
-            <span class="sidebar-conv-badge">{refMessagesCount}</span>
-          )}
-        </button>
-      </div>
+      {/* Hide conversation button when there's no data */}
+      {(fileDiffs.length > 0 || history.length > 0 || externalChanges.length > 0) && (
+        <div class="sidebar-footer">
+          <button
+            class={`sidebar-conversation-toggle${conversationOpen ? " conv-active" : ""}`}
+            title={conversationOpen ? "Hide conversation" : "Show conversation"}
+            onClick={onToggleConversation}
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            <span>Conversation</span>
+            {refMessagesCount > 0 && (
+              <span class="sidebar-conv-badge">{refMessagesCount}</span>
+            )}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

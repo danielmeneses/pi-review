@@ -96,6 +96,13 @@ export interface FileDiff {
   /** Whether any of the pending changes in this cycle were preceded by
    * external (user/TUI) modifications to the file. */
   hasExternalChanges: boolean;
+  /**
+   * Line numbers that were modified by external (non-agent) sources.
+   * 1-based line numbers in the current file state.
+   */
+  externalChangedLines?: number[];
+  /** Timestamp of the most recent external change. */
+  externalChangeTime?: number;
 }
 
 /**
@@ -132,6 +139,8 @@ export interface AggregatedState {
   history: ChangeCycle[];
   /** Raw per-tool-call changes (audit trail, backward compat). */
   rawChanges: TrackedChange[];
+  /** Externally detected file changes (not from agent tools). */
+  externalChanges: ExternalFileChange[];
   /** Next ID counter for new changes. */
   nextId: number;
   /** Next cycle ID counter. */
@@ -150,4 +159,27 @@ export interface LineComment {
   lineNum: number;
   /** The comment text (instruction for the agent). */
   text: string;
+}
+
+/**
+ * External file change detected by the file watcher.
+ *
+ * Tracks modifications made outside the agent (user editor, TUI, etc.).
+ * Each entry captures which lines changed and a diff from the last
+ * known agent state.
+ * Multiple entries can exist for the same file — one per external modification.
+ */
+export interface ExternalFileChange {
+  /** Unique ID for this external change entry. */
+  id: string;
+  /** Absolute file path. */
+  filePath: string;
+  /** File path relative to project root. */
+  relativePath: string;
+  /** 1-based line numbers that were externally modified. */
+  changedLines: number[];
+  /** Timestamp of the last external change. */
+  timestamp: number;
+  /** Unified diff of all external changes since last known agent state. */
+  diff: string;
 }

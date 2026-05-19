@@ -28,7 +28,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import type { ChangeState, AggregatedState, FileDiff } from "./types.js";
+import type { ChangeState, AggregatedState, FileDiff, ExternalFileChange } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Tracker interface (dependency injection for testability)
@@ -54,6 +54,11 @@ export interface TrackerInterface {
   drainReferenceResponses?: () => Array<{ text: string; timestamp: number }>;
   sendChat?: (message: string) => void;
   drainChatResponses?: () => Array<{ text: string; timestamp: number }>;
+  getExternalChanges?: () => ExternalFileChange[];
+  acknowledgeExternalChanges?: (filePath: string) => void;
+  acknowledgeAllExternalChanges?: () => void;
+  clearExternalChanges?: (filePath: string) => void;
+  clearAllExternalChanges?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +204,7 @@ export class WebServer {
       if (fileRevertMatch) {
         return this.handleRevertFile(decodeURIComponent(fileRevertMatch[1]), res);
       }
+
     }
 
     // Global accept/revert all
@@ -242,11 +248,29 @@ export class WebServer {
       return this.handleChatResponsePoll(res);
     }
 
+    // External changes
+    if (path === "/api/external-changes" && method === "GET") {
+      return this.handleGetExternalChanges(res);
+    }
+    if (path === "/api/external-changes/acknowledge-all" && method === "POST") {
+      return this.handleAcknowledgeAllExternal(res);
+    }
+    if (method === "POST") {
+      const ackMatch = path.match(/^\/api\/external-changes\/acknowledge\/(.+)$/);
+      if (ackMatch) {
+        return this.handleAcknowledgeExternal(decodeURIComponent(ackMatch[1]), res);
+      }
+      const clearExternalMatch = path.match(/^\/api\/external-changes\/clear\/(.+)$/);
+      if (clearExternalMatch) {
+        return this.handleClearExternal(clearExternalMatch[1], res);
+      }
+    }
+
     // Open file in VS Code
     if (method === "POST") {
       const editorMatch = path.match(/^\/api\/open-in-editor\/(.+)$/);
       if (editorMatch) {
-        return this.handleOpenInEditor(decodeURIComponent(editorMatch[1]), res);
+        return this.handleOpenInEditor(decodeURIComponent(editorMatch[1]), req, res);
       }
     }
 
@@ -359,6 +383,14 @@ export class WebServer {
   }
 
   /**
+   * POST /api/files/:path/edit-line  -- edit a specific line in a file.
+   * Body: { lineNum: number, newContent: string }
+   * Reads the current file, replaces the line, writes back, and records a
+   * TrackedChange so the edit shows up as a pending change in the review UI.
+   */
+
+
+  /**
    * POST /api/comments/send  -- send line comments to the agent as instructions.
    * Reads the JSON body { comments: [{ filePath, relativePath, lineNum, text }] }
    * and emits them as a prompt for the agent.
@@ -463,6 +495,37 @@ export class WebServer {
     sendJson(res, 200, { success: true, count, filePath });
   }
 
+  // ------------------------------------------------------------------
+  // External change handlers
+  // ------------------------------------------------------------------
+
+  /** GET /api/external-changes — return all external changes. */
+  private handleGetExternalChanges(res: ServerResponse): void {
+    const changes = this.tracker.getExternalChanges?.() ?? [];
+    sendJson(res, 200, changes);
+  }
+
+  /** POST /api/external-changes/acknowledge/:path — acknowledge a specific file. */
+  private handleAcknowledgeExternal(filePath: string, res: ServerResponse): void {
+    this.tracker.acknowledgeExternalChanges?.(filePath);
+    this.broadcastUpdate();
+    sendJson(res, 200, { success: true, filePath });
+  }
+
+  /** POST /api/external-changes/acknowledge-all — acknowledge all. */
+  private handleAcknowledgeAllExternal(res: ServerResponse): void {
+    this.tracker.acknowledgeAllExternalChanges?.();
+    this.broadcastUpdate();
+    sendJson(res, 200, { success: true });
+  }
+
+  /** POST /api/external-changes/clear/:path — clear external changes for a file. */
+  private handleClearExternal(filePath: string, res: ServerResponse): void {
+    this.tracker.clearExternalChanges?.(filePath);
+    this.broadcastUpdate();
+    sendJson(res, 200, { success: true, filePath });
+  }
+
   /** GET /api/comments/response — poll for agent responses to comments. */
   private handleCommentResponsePoll(res: ServerResponse): void {
     const responses = this.tracker.drainCommentResponses?.() ?? [];
@@ -496,20 +559,48 @@ export class WebServer {
   }
 
   /**
-   * POST /api/open-in-editor/:path  -- open a file in VS Code.
+   * POST /api/open-in-editor/:path  -- open a file in the given editor.
+   * Reads `editor` from the JSON body (defaults to "code").
+   *
+   * Supported editors:
+   *   code     → VS Code       (code --goto file)
+   *   cursor   → Cursor        (cursor --goto file)
+   *   windsurf → Windsurf      (windsurf --goto file)
+   *   idea     → IntelliJ IDEA (idea file)
+   *   webstorm → WebStorm      (webstorm file)
    */
-  private handleOpenInEditor(filePath: string, res: ServerResponse): void {
-    try {
-      // Open the project root first, then jump to the file
-      const result = spawnSync("code", [this.cwd, "--goto", filePath], { timeout: 5000 });
-      if (result.error) {
-        sendJson(res, 500, { success: false, error: result.error.message });
-      } else {
-        sendJson(res, 200, { success: true });
+  private handleOpenInEditor(filePath: string, req: IncomingMessage, res: ServerResponse): void {
+    let editor = "code";
+    let body = "";
+    req.on("data", (chunk: string) => { body += chunk; });
+    req.on("end", () => {
+      try {
+        if (body) {
+          const data = JSON.parse(body);
+          if (data.editor) editor = data.editor;
+        }
+      } catch { /* use default */ }
+
+      const editors: Record<string, { cmd: string; args: string[] }> = {
+        code:     { cmd: "code",     args: [this.cwd, "--goto", filePath] },
+        cursor:   { cmd: "cursor",   args: [this.cwd, "--goto", filePath] },
+        windsurf: { cmd: "windsurf", args: [this.cwd, "--goto", filePath] },
+        idea:     { cmd: "idea",     args: [filePath] },
+        webstorm: { cmd: "webstorm", args: [filePath] },
+      };
+
+      const cfg = editors[editor] ?? editors.code;
+      try {
+        const result = spawnSync(cfg.cmd, cfg.args, { timeout: 5000 });
+        if (result.error) {
+          sendJson(res, 500, { success: false, error: result.error.message });
+        } else {
+          sendJson(res, 200, { success: true });
+        }
+      } catch (e) {
+        sendJson(res, 500, { success: false, error: String(e) });
       }
-    } catch (e) {
-      sendJson(res, 500, { success: false, error: String(e) });
-    }
+    });
   }
 
   // ------------------------------------------------------------------

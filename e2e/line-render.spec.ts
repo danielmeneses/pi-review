@@ -75,7 +75,7 @@ test("addition rows show new file line numbers", async ({ page, baseUrl }) => {
   }
 });
 
-test("deletion rows show original file line numbers", async ({ page, baseUrl }) => {
+test("deletion rows show empty line numbers (not in new file)", async ({ page, baseUrl }) => {
   await page.goto(baseUrl + "/");
   await page.waitForSelector("#sidebar-list", { state: "visible", timeout: 5000 });
 
@@ -85,8 +85,9 @@ test("deletion rows show original file line numbers", async ({ page, baseUrl }) 
   const delCount = await delRows.count();
   if (delCount > 0) {
     for (let i = 0; i < delCount; i++) {
+      // Deleted lines don't exist in the new file, so line number is empty
       const lineNum = await delRows.nth(i).locator(".line-num").textContent();
-      expect(parseInt(lineNum!, 10)).toBeGreaterThan(0);
+      expect(lineNum?.trim()).toBe("");
     }
   }
 });

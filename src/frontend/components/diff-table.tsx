@@ -34,6 +34,8 @@ export interface DiffTableProps {
   editingCommentDraft: string;
   /** Whether comments are allowed (false for accepted/reverted/history views). */
   allowComments: boolean;
+  /** Set of line numbers that were externally changed (for showing line icons). */
+  externalChangedLines?: Set<number>;
   /** Called to start editing a comment on a line. rowKey uniquely identifies the row. */
   onStartEditComment: (filePath: string, lineNum: number, rowKey: string) => void;
   /** Called to save a comment. */
@@ -273,7 +275,8 @@ function parseDiffRows(diff: string): Array<{
       origLineNum++;
       newLineNum++;
       rows.push({ type: "ctx", origLineNum, newLineNum, content: line.slice(1), sign: " " });
-    } else if (line === "") {
+    } else if (line === "" || line.startsWith("\\")) {
+      // Skip empty lines and diff metadata like "\ No newline at end of file"
       continue;
     } else {
       rows.push({ type: "ctx", origLineNum, newLineNum, content: line, sign: "" });
@@ -300,6 +303,7 @@ export function DiffTable(props: DiffTableProps): JSX.Element {
     editingComment,
     editingCommentDraft,
     allowComments,
+    externalChangedLines,
     onStartEditComment,
     onSaveComment,
     onCancelComment,
@@ -377,8 +381,10 @@ export function DiffTable(props: DiffTableProps): JSX.Element {
       ? null
       : renderCommentIndicator(fileComments, rowKey, lineNum);
 
+    const isExternalLine = externalChangedLines && lineNum > 0 && externalChangedLines.has(lineNum);
+
     tableRows.push(
-      <tr key={idx} class={`diff-${row.type}${fileStatus !== "pending" ? ` diff-status-${fileStatus}` : ""}`} data-line={lineNum} data-type={row.type}>
+      <tr key={idx} class={`diff-${row.type}${fileStatus !== "pending" ? ` diff-status-${fileStatus}` : ""}${isExternalLine ? " diff-external" : ""}`} data-line={lineNum} data-type={row.type}>
         <td
           class={`line-num${allowComments ? "" : " line-num-disabled"}`}
           data-action={allowComments ? "comment-line" : undefined}
@@ -390,6 +396,7 @@ export function DiffTable(props: DiffTableProps): JSX.Element {
           }
         >
           {row.type === "del" ? "" : lineNum}
+          {isExternalLine && <span class="ext-change-icon" title="Externally modified">⚡</span>}
         </td>
         <td class="line-sign">{fileStatus === "accepted" ? "✓" : fileStatus === "reverted" ? "✕" : row.sign}</td>
         <td class="line-content">

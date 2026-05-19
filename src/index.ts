@@ -1,4 +1,6 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ChangeTracker } from "./tracker.js";
 import { WebServer } from "./server.js";
@@ -43,9 +45,17 @@ export default function (pi: ExtensionAPI) {
     console.error("[pi-review] server failed to start:", e);
   });
 
+  // Detect if dist/ is missing (e.g. git install without a build step)
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const distJs = resolve(__dirname, "../dist/frontend.js");
+  let distMissing = !existsSync(distJs);
+
   pi.on("session_start", async (_event, ctx) => {
-    tracker.reconstructFromSession(ctx);
-    // Ensure server is started (may already be running from fire-and-forget)
+    if (distMissing) {
+      ctx.ui.notify("pi-review: frontend not built. Run 'npm run build:frontend' and then /reload.", "error");
+    }
+    // Disk state was already loaded in the constructor — no session replay needed.
+    // Ensure server is started (may already be running from fire-and-forget).
     if (!server.isRunning()) {
       try {
         port = await server.start();
@@ -58,9 +68,6 @@ export default function (pi: ExtensionAPI) {
       "pi-review",
       running ? `tracker ready — /review → http://localhost:${port ?? 3123}` : `tracker not running — /review to start`,
     );
-    if (process.env.PI_REVIEW_DEBUG === "1") {
-      console.error("[pi-review] session_start, server running:", running, "port:", port);
-    }
   });
 
   pi.on("session_shutdown", () => {

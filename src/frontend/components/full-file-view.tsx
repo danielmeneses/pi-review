@@ -20,6 +20,7 @@ import {
 import { highlightLine } from "../highlight.js";
 import { extractSelectedLines, type SelectedLineInfo } from "../selection.js";
 
+
 // ---------------------------------------------------------------------------
 // Props
 // ---------------------------------------------------------------------------
@@ -49,6 +50,8 @@ export interface FullFileViewProps {
   onDraftChange: (value: string) => void;
   /** Called when user right-clicks selected lines to reference code. */
   onReference?: (lines: SelectedLineInfo[], filePath: string) => void;
+  /** Set of line numbers that were externally changed (for showing line icons). */
+  externalChangedLines?: Set<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +325,7 @@ export function FullFileView(props: FullFileViewProps): JSX.Element {
     editingComment,
     editingCommentDraft,
     allowComments,
+    externalChangedLines,
     onStartEditComment,
     onSaveComment,
     onCancelComment,
@@ -333,6 +337,8 @@ export function FullFileView(props: FullFileViewProps): JSX.Element {
   // Context menu state — captures selection at right-click time
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; lines: any[] } | null>(null);
   const tableRef = useRef<HTMLTableElement>(null);
+
+
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -388,6 +394,7 @@ export function FullFileView(props: FullFileViewProps): JSX.Element {
       const lineNum = i + 1;
       const rowKey = `${lineNum}-ctx`;
       const isEditing = allowComments && isLineEditing(editingComment, fileDiff.filePath, rowKey);
+      const isExternalLine = externalChangedLines && externalChangedLines.has(lineNum);
       const commentBubble = (isEditing || !allowComments)
         ? null
         : renderCommentBubble(fileDiff.filePath, lineNum, rowKey, fileComments, onStartEditComment, onRemoveComment);
@@ -396,7 +403,7 @@ export function FullFileView(props: FullFileViewProps): JSX.Element {
         : renderCommentIndicator(fileComments, rowKey, lineNum);
 
       tableRows.push(
-        <tr key={i} class="diff-ctx">
+        <tr key={i} class={`diff-ctx${isExternalLine ? " diff-external" : ""}`}>
           <td
             class={`line-num${allowComments ? "" : " line-num-disabled"}`}
             data-action={allowComments ? "comment-line" : undefined}
@@ -408,6 +415,7 @@ export function FullFileView(props: FullFileViewProps): JSX.Element {
             }
           >
             {lineNum}
+            {isExternalLine && <span class="ext-change-icon" title="Externally modified">⚡</span>}
           </td>
           <td class="line-sign"> </td>
           <td class="line-content">
@@ -514,9 +522,10 @@ export function FullFileView(props: FullFileViewProps): JSX.Element {
 
     const sign = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
     const showLineNum = row.displayLineNum > 0 ? String(row.displayLineNum) : "";
+    const isExternalLine = externalChangedLines && row.displayLineNum > 0 && externalChangedLines.has(row.displayLineNum);
 
     tableRows.push(
-      <tr key={i} class={`diff-${row.type}`} data-line={row.displayLineNum > 0 ? row.displayLineNum : 0} data-type={row.type}>
+      <tr key={i} class={`diff-${row.type}${isExternalLine ? " diff-external" : ""}`} data-line={row.displayLineNum > 0 ? row.displayLineNum : 0} data-type={row.type}>
         <td
           class={`line-num${allowComments && lineNum > 0 ? "" : " line-num-disabled"}`}
           data-action={allowComments && lineNum > 0 ? "comment-line" : undefined}
@@ -528,6 +537,7 @@ export function FullFileView(props: FullFileViewProps): JSX.Element {
           }
         >
           {showLineNum}
+          {isExternalLine && <span class="ext-change-icon" title="Externally modified">⚡</span>}
         </td>
         <td class="line-sign">{sign}</td>
         <td class="line-content">
