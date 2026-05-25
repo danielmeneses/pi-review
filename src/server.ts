@@ -34,6 +34,12 @@ import type { ChangeState, AggregatedState, FileDiff, ExternalFileChange } from 
 // Tracker interface (dependency injection for testability)
 // ---------------------------------------------------------------------------
 
+/** A single line entry with diff type annotation. */
+export interface SelectedLineEntry {
+  content: string;
+  type: "add" | "del" | "ctx";
+}
+
 export interface TrackerInterface {
   getChanges: () => ChangeState["changes"];
   getState: () => ChangeState;
@@ -46,8 +52,8 @@ export interface TrackerInterface {
   revertAll: () => number;
   getPendingCount: () => number;
   emitComments?: (comments: Array<{ filePath: string; relativePath: string; lineNum: number; text: string }>) => void;
-  emitReference?: (params: { filePath: string; relativePath: string; startLine: number; endLine: number; code: string; question: string; mode: "ask" | "edit" }) => void;
-  emitReferenceFollowup?: (params: { filePath: string; relativePath: string; startLine: number; endLine: number; code: string; messages: Array<{ role: string; text: string }>; question: string; mode: "ask" | "edit" }) => void;
+  emitReference?: (params: { filePath: string; relativePath: string; startLine: number; endLine: number; code: string; lines?: SelectedLineEntry[]; question: string; mode: "ask" | "edit" }) => void;
+  emitReferenceFollowup?: (params: { filePath: string; relativePath: string; startLine: number; endLine: number; code: string; lines?: SelectedLineEntry[]; messages: Array<{ role: string; text: string }>; question: string; mode: "ask" | "edit" }) => void;
   clearNonPending: () => number;
   clearFile: (filePath: string) => number;
   drainCommentResponses?: () => Array<{ text: string; timestamp: number }>;
@@ -93,13 +99,17 @@ export class WebServer {
       ? this.tracker.getAggregatedState()
       : { fileDiffs: [], rawChanges: this.tracker.getChanges(), nextId: 0 };
 
-    // Include any pending comment responses
+    // Include any pending responses
     const commentResponses = this.tracker.drainCommentResponses?.() ?? [];
+    const referenceResponses = this.tracker.drainReferenceResponses?.() ?? [];
+    const chatResponses = this.tracker.drainChatResponses?.() ?? [];
 
     this.broadcastSSE(JSON.stringify({
       type: "update",
       data: state,
       commentResponses: commentResponses.length > 0 ? commentResponses : undefined,
+      referenceResponses: referenceResponses.length > 0 ? referenceResponses : undefined,
+      chatResponses: chatResponses.length > 0 ? chatResponses : undefined,
     }));
   }
 
@@ -439,6 +449,7 @@ export class WebServer {
           startLine: data.startLine || 0,
           endLine: data.endLine || 0,
           code: data.code,
+          lines: Array.isArray(data.lines) ? data.lines : undefined,
           question: data.question,
           mode: data.mode === 'edit' ? 'edit' : 'ask',
         });
@@ -468,6 +479,7 @@ export class WebServer {
           startLine: data.startLine || 0,
           endLine: data.endLine || 0,
           code: data.code || '',
+          lines: Array.isArray(data.lines) ? data.lines : undefined,
           messages: data.messages || [],
           question: data.question,
           mode: data.mode === 'edit' ? 'edit' : 'ask',

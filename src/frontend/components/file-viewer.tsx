@@ -7,6 +7,7 @@
  */
 
 import { JSX } from "preact";
+import { useMemo, useRef } from "preact/hooks";
 import type { FileDiff, ChangeCycle, ExternalFileChange } from "../../types.js";
 import {
   dotClassForStatus,
@@ -18,9 +19,11 @@ import {
   type EditingComment,
 } from "../utils.js";
 import { DiffTable } from "./diff-table.js";
-import { FullFileView } from "./full-file-view.js";
+import { FullFileView, buildMinimapLinesPlain, buildMinimapLinesFull, parseDiffRows, buildFullFileRows } from "./full-file-view.js";
 import { EditorSelector } from "./editor-selector.js";
+import { CodeMinimap } from "./code-minimap.js";
 import type { SelectedLineInfo } from "../selection.js";
+import type { MinimapLine } from "./code-minimap.js";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -222,6 +225,17 @@ export function FileViewer(props: FileViewerProps): JSX.Element {
   const dotClass = dotClassForStatus(f.status);
   const badgeClass = `badge-${f.status}`;
 
+  // Build minimap lines for full-file view
+  const minimapLines: MinimapLine[] = useMemo(() => {
+    if (!showFullFile || !fileContent) return [];
+    if (!isPending) {
+      return buildMinimapLinesPlain(fileContent);
+    }
+    const dRows = parseDiffRows(f.diff);
+    const fullRows = buildFullFileRows(fileContent, dRows);
+    return buildMinimapLinesFull(fullRows);
+  }, [showFullFile, fileContent, isPending, f.diff, f.filePath]);
+
   return (
     <div class="file-viewer">
       <div class="file-header">
@@ -320,9 +334,18 @@ export function FileViewer(props: FileViewerProps): JSX.Element {
           )}
         </div>
       </div>
-      <div class="diff-scroll">
-        {buildExternalChangedLines(f.externalChangedLines, showFullFile, f, fileContent, lineComments, editingComment, editingCommentDraft, isPending, onStartEditComment, onSaveComment, onCancelComment, onRemoveComment, onDraftChange, onReference)}
-      </div>
+      {showFullFile ? (
+        <div class="file-body-with-minimap">
+          <div class="diff-scroll">
+            {buildExternalChangedLines(f.externalChangedLines, showFullFile, f, fileContent, lineComments, editingComment, editingCommentDraft, isPending, onStartEditComment, onSaveComment, onCancelComment, onRemoveComment, onDraftChange, onReference)}
+          </div>
+          <CodeMinimap lines={minimapLines} />
+        </div>
+      ) : (
+        <div class="diff-scroll">
+          {buildExternalChangedLines(f.externalChangedLines, showFullFile, f, fileContent, lineComments, editingComment, editingCommentDraft, isPending, onStartEditComment, onSaveComment, onCancelComment, onRemoveComment, onDraftChange, onReference)}
+        </div>
+      )}
     </div>
   );
 }

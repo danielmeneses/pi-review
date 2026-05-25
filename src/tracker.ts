@@ -1696,8 +1696,24 @@ export class ChangeTracker {
   }
 
   /**
+   * Build an annotated code block with diff prefixes.
+   * Each line is prefixed with + (added), - (removed), or space (context).
+   * Falls back to plain code if no per-line type info available.
+   */
+  private buildAnnotatedCodeBlock(code: string, lines?: Array<{ content: string; type: "add" | "del" | "ctx" }>): string {
+    if (!lines || lines.length === 0) {
+      return code;
+    }
+    return lines.map((l) => {
+      const prefix = l.type === "add" ? "+" : l.type === "del" ? "-" : " ";
+      return `${prefix}${l.content}`;
+    }).join("\n");
+  }
+
+  /**
    * Emit a code reference question to the agent.
    * Formats the selected code + user question and sends as a prompt.
+   * Code block lines are annotated with diff prefixes (+/-/ ) when available.
    */
   emitReference(params: {
     filePath: string;
@@ -1705,6 +1721,7 @@ export class ChangeTracker {
     startLine: number;
     endLine: number;
     code: string;
+    lines?: Array<{ content: string; type: "add" | "del" | "ctx" }>;
     question: string;
     mode: "ask" | "edit";
   }): void {
@@ -1728,7 +1745,15 @@ export class ChangeTracker {
     ];
 
     if (hasCode) {
-      promptParts.push("", "**Selected code:**", "```", params.code, "```");
+      const hasLineTypes = params.lines && params.lines.length > 0;
+      const annotatedCode = this.buildAnnotatedCodeBlock(params.code, params.lines);
+      promptParts.push("", "**Selected code:**", "```");
+      promptParts.push(annotatedCode);
+      promptParts.push("```");
+      if (hasLineTypes) {
+        promptParts.push("");
+        promptParts.push("**Legend:** Lines prefixed with `+` were **added**, `-` were **removed**, and ` ` (space) are **unchanged context**. Use these markers to understand which lines are new changes vs existing code.");
+      }
     }
 
     promptParts.push("", `**My request:** ${params.question}`, "");
@@ -1754,6 +1779,7 @@ export class ChangeTracker {
     startLine: number;
     endLine: number;
     code: string;
+    lines?: Array<{ content: string; type: "add" | "del" | "ctx" }>;
     messages: Array<{ role: string; text: string }>;
     question: string;
     mode: "ask" | "edit";
@@ -1781,7 +1807,15 @@ export class ChangeTracker {
     ];
 
     if (hasCode) {
-      promptParts.push("", "**Original code:**", "```", params.code, "```");
+      const hasLineTypes = params.lines && params.lines.length > 0;
+      const annotatedCode = this.buildAnnotatedCodeBlock(params.code, params.lines);
+      promptParts.push("", "**Original code:**", "```");
+      promptParts.push(annotatedCode);
+      promptParts.push("```");
+      if (hasLineTypes) {
+        promptParts.push("");
+        promptParts.push("**Legend:** Lines prefixed with `+` were **added**, `-` were **removed**, and ` ` (space) are **unchanged context**. Use these markers to understand which lines are new changes vs existing code.");
+      }
     }
 
     promptParts.push(

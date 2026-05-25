@@ -14,12 +14,19 @@ import { esc } from "../utils.js";
 // Types
 // ---------------------------------------------------------------------------
 
+export interface SelectedLineEntry {
+  content: string;
+  type: "add" | "del" | "ctx";
+}
+
 export interface SelectedLines {
   filePath: string;
   relativePath: string;
   startLine: number;
   endLine: number;
   code: string;
+  /** Per-line entries with diff type (add/del/ctx). Used for annotated code block. */
+  lines?: SelectedLineEntry[];
 }
 
 export interface ConversationMessage {

@@ -107,6 +107,12 @@ export async function apiClearFile(filePath: string): Promise<{ success: boolean
   return res.json();
 }
 
+/** A single line entry with diff type annotation. */
+export interface SelectedLineEntry {
+  content: string;
+  type: "add" | "del" | "ctx";
+}
+
 /** Send a code reference + question to the agent. */
 export async function apiSendReference(params: {
   filePath: string;
@@ -114,6 +120,7 @@ export async function apiSendReference(params: {
   startLine: number;
   endLine: number;
   code: string;
+  lines?: SelectedLineEntry[];
   question: string;
   mode: "ask" | "edit";
 }): Promise<{ success: boolean }> {
@@ -185,6 +192,7 @@ export async function apiSendFollowup(params: {
   startLine: number;
   endLine: number;
   code: string;
+  lines?: SelectedLineEntry[];
   messages: Array<{ role: string; text: string }>;
   question: string;
   mode: "ask" | "edit";
@@ -216,11 +224,15 @@ export class SSEManager {
   private onUpdate: SSEUpdateHandler | null = null;
   private onStatusChange: ((status: SSEStatus) => void) | null = null;
   private onCommentResponse: ((responses: Array<{ text: string; timestamp: number }>) => void) | null = null;
+  private onReferenceResponse: ((responses: Array<{ text: string; timestamp: number }>) => void) | null = null;
 
   setUpdateHandler(handler: SSEUpdateHandler): void { this.onUpdate = handler; }
   setStatusHandler(handler: (status: SSEStatus) => void): void { this.onStatusChange = handler; }
   setCommentResponseHandler(handler: (responses: Array<{ text: string; timestamp: number }>) => void): void {
     this.onCommentResponse = handler;
+  }
+  setReferenceResponseHandler(handler: (responses: Array<{ text: string; timestamp: number }>) => void): void {
+    this.onReferenceResponse = handler;
   }
 
   /** Get the current connection status. */
@@ -245,6 +257,9 @@ export class SSEManager {
             if (this.onUpdate) this.onUpdate(msg.data);
             if (msg.commentResponses && this.onCommentResponse) {
               this.onCommentResponse(msg.commentResponses);
+            }
+            if (msg.referenceResponses && this.onReferenceResponse) {
+              this.onReferenceResponse(msg.referenceResponses);
             }
           }
         } catch (err) {

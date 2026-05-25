@@ -105,9 +105,12 @@ export function App(): JSX.Element {
   const refMessagesRef = useRef<ConversationMessage[]>([]);
   const refDraftRef = useRef("");
   const lastSelectionRef = useRef<SelectedLines | null>(null);
+  const refResponseReceivedRef = useRef(false);
+  const refSendingRef = useRef(false);
 
   useEffect(() => { refMessagesRef.current = refMessages; }, [refMessages]);
   useEffect(() => { refDraftRef.current = refDraft; }, [refDraft]);
+  useEffect(() => { refSendingRef.current = refSending; }, [refSending]);
 
   // -- Refs --
   const sseManagerRef = useRef<SSEManager | null>(null);
@@ -166,6 +169,16 @@ export function App(): JSX.Element {
   }, []);
 
   // Comment response handler — marks sent comments as done when response arrives
+  const handleReferenceResponse = useCallback((responses: Array<{ text: string; timestamp: number }>) => {
+    if (responses.length > 0 && !refResponseReceivedRef.current) {
+      refResponseReceivedRef.current = true;
+      const responseText = responses[0].text;
+      setRefResponse(responseText);
+      setRefMessages((prev) => [...prev, { role: "agent", text: responseText, timestamp: Date.now() }]);
+      setRefSending(false);
+    }
+  }, []);
+
   const handleCommentResponse = useCallback((responses: Array<{ text: string; timestamp: number }>) => {
     setLineComments((prev) => {
       let ri = 0;
@@ -219,6 +232,7 @@ export function App(): JSX.Element {
 
     sse.setUpdateHandler(handleSSEUpdate);
     sse.setCommentResponseHandler(handleCommentResponse);
+    sse.setReferenceResponseHandler(handleReferenceResponse);
     sse.setStatusHandler(setSseStatus);
     sse.connect();
 
@@ -543,8 +557,13 @@ export function App(): JSX.Element {
     const startLine = sorted[0].lineNum;
     const endLine = sorted[sorted.length - 1].lineNum;
     const code = sorted.map(l => l.content).join("\n");
-    const sel: SelectedLines = { filePath, relativePath: relPath, startLine, endLine, code };
+    const lineEntries = sorted.map(l => ({
+      content: l.content,
+      type: (l.type === "add" ? "add" : l.type === "del" ? "del" : "ctx") as "add" | "del" | "ctx",
+    }));
+    const sel: SelectedLines = { filePath, relativePath: relPath, startLine, endLine, code, lines: lineEntries };
     lastSelectionRef.current = sel;
+    refResponseReceivedRef.current = false;
     setRefSelection(sel);
     setRefMessages([]);
     setRefDraft("");
@@ -561,6 +580,7 @@ export function App(): JSX.Element {
     const draft = refDraftRef.current.trim();
     if (!refSelection || !draft) return;
     const question = draft;
+    refResponseReceivedRef.current = false;
     const userMsg: ConversationMessage = { role: "user", text: question, timestamp: Date.now() };
     const updatedMessages = [...existingMessages, userMsg];
     setRefMessages(updatedMessages);

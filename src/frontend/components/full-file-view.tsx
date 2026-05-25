@@ -19,6 +19,19 @@ import {
 } from "../utils.js";
 import { highlightLine } from "../highlight.js";
 import { extractSelectedLines, type SelectedLineInfo } from "../selection.js";
+import type { MinimapLine } from "./code-minimap.js";
+
+/** Build minimap lines from content (non-pending: all ctx). */
+export function buildMinimapLinesPlain(content: string): MinimapLine[] {
+  const lines = content.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines.map((line, i) => ({ type: "ctx" as const, lineNum: i + 1, content: line }));
+}
+
+/** Build minimap lines from fullRows (pending: typed add/del/ctx). */
+export function buildMinimapLinesFull(fullRows: Array<{ type: "add" | "del" | "ctx"; displayLineNum: number; content: string }>): MinimapLine[] {
+  return fullRows.map((row) => ({ type: row.type, lineNum: row.displayLineNum, content: row.content }));
+}
 
 
 // ---------------------------------------------------------------------------
@@ -61,7 +74,7 @@ export interface FullFileViewProps {
 /**
  * Parse a unified diff into rows with line number tracking.
  */
-function parseDiffRows(diff: string): Array<{
+export function parseDiffRows(diff: string): Array<{
   type: "add" | "del" | "ctx";
   origLineNum: number;
   newLineNum: number;
@@ -115,7 +128,7 @@ function parseDiffRows(diff: string): Array<{
  * Line numbers track the actual file position (sequential from 1).
  * Deleted lines are shown without a line number (they no longer exist).
  */
-function buildFullFileRows(
+export function buildFullFileRows(
   currentContent: string,
   diffRows: Array<{ type: "add" | "del" | "ctx"; origLineNum: number; newLineNum: number; content: string }>,
 ): Array<{
