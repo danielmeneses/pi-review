@@ -185,6 +185,14 @@ export async function apiPollReferenceResponse(): Promise<Array<{ text: string; 
   return data.responses ?? [];
 }
 
+/** Search project files by name (substring match, case-insensitive). */
+export async function apiSearchFiles(query: string): Promise<Array<{ relativePath: string; absolutePath: string }>> {
+  const res = await fetch(`/api/search-files?q=${encodeURIComponent(query)}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.results ?? [];
+}
+
 /** Send a follow-up message with conversation history. */
 export async function apiSendFollowup(params: {
   filePath: string;

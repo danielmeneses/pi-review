@@ -8,10 +8,12 @@
 import { render } from "preact";
 import { App } from "./app.js";
 
-// Mount the app
-const root = document.getElementById("pi-review-app");
-if (root) {
-  render(<App />, root);
+// Mount the app — guard against double initialization
+const appRoot = document.getElementById("pi-review-app");
+if (appRoot && appRoot.children.length === 0) {
+  render(<App />, appRoot);
+} else if (appRoot) {
+  console.warn("[PIReview] app already mounted, skipping duplicate render");
 } else {
   console.error("[PIReview] #pi-review-app element not found in DOM");
 }

@@ -157,6 +157,8 @@ export function FileViewer(props: FileViewerProps): JSX.Element {
     onReference,
   } = props;
 
+  const fullFileScrollRef = useRef<HTMLDivElement>(null);
+
   // If a history cycle is selected, show that cycle's diff
   if (selectedCycle) {
     return <HistoryCycleView cycle={selectedCycle} onReference={onReference} />;
@@ -336,10 +338,10 @@ export function FileViewer(props: FileViewerProps): JSX.Element {
       </div>
       {showFullFile ? (
         <div class="file-body-with-minimap">
-          <div class="diff-scroll">
+          <div class="diff-scroll" ref={fullFileScrollRef}>
             {buildExternalChangedLines(f.externalChangedLines, showFullFile, f, fileContent, lineComments, editingComment, editingCommentDraft, isPending, onStartEditComment, onSaveComment, onCancelComment, onRemoveComment, onDraftChange, onReference)}
           </div>
-          <CodeMinimap lines={minimapLines} />
+          <CodeMinimap lines={minimapLines} scrollRef={fullFileScrollRef} />
         </div>
       ) : (
         <div class="diff-scroll">

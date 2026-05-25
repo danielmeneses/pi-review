@@ -416,7 +416,7 @@ export function FullFileView(props: FullFileViewProps): JSX.Element {
         : renderCommentIndicator(fileComments, rowKey, lineNum);
 
       tableRows.push(
-        <tr key={i} class={`diff-ctx${isExternalLine ? " diff-external" : ""}`}>
+        <tr key={i} class={`diff-ctx${isExternalLine ? " diff-external" : ""}`} data-line={lineNum} data-type="ctx">
           <td
             class={`line-num${allowComments ? "" : " line-num-disabled"}`}
             data-action={allowComments ? "comment-line" : undefined}

@@ -24,7 +24,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -248,6 +248,11 @@ export class WebServer {
     // Poll for reference responses
     if (path === "/api/reference/response" && method === "GET") {
       return this.handleReferenceResponsePoll(res);
+    }
+
+    // Search files
+    if (path === "/api/search-files" && method === "GET") {
+      return this.handleSearchFiles(req, res);
     }
 
     // Chat
@@ -571,6 +576,75 @@ export class WebServer {
   }
 
   /**
+   * GET /api/search-files?q=query  -- search project files by name.
+   * Excludes files matching .gitignore patterns.
+   */
+  private handleSearchFiles(req: IncomingMessage, res: ServerResponse): void {
+    const url = new URL(req.url ?? "/", `http://localhost:${this.port}`);
+    const query = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    if (!query || query.length < 2) {
+      sendJson(res, 200, { results: [] });
+      return;
+    }
+
+    const results: Array<{ relativePath: string; absolutePath: string }> = [];
+    const maxResults = 50;
+
+    // Walk directory recursively skipping noise dirs
+    try {
+      this.searchDir(this.cwd, "", query, results, maxResults);
+    } catch {
+      // Best effort
+    }
+
+    sendJson(res, 200, { results });
+  }
+
+  /** Recursively walk a directory looking for filename matches. */
+  private searchDir(
+    baseDir: string,
+    relDir: string,
+    query: string,
+    results: Array<{ relativePath: string; absolutePath: string }>,
+    maxResults: number,
+  ): void {
+    if (results.length >= maxResults) return;
+    const absDir = join(baseDir, relDir);
+    let entries: string[];
+    try {
+      entries = readdirSync(absDir);
+    } catch {
+      return;
+    }
+
+    // Skip noise dirs
+    const skipDirs = new Set(["node_modules", ".git", "dist", "build", ".next", "__pycache__", ".pi", "vendor", "target", ".cache"]);
+
+    for (const name of entries) {
+      if (results.length >= maxResults) return;
+      const relPath = relDir ? `${relDir}/${name}` : name;
+      const absPath = join(absDir, name);
+
+      let st;
+      try { st = statSync(absPath); } catch { continue; }
+
+      if (st.isDirectory()) {
+        if (skipDirs.has(name)) continue;
+        if (name.startsWith(".")) continue; // skip hidden dirs
+        this.searchDir(baseDir, relPath, query, results, maxResults);
+      } else if (st.isFile()) {
+        // Skip binary-looking extensions
+        const ext = name.includes(".") ? name.slice(name.lastIndexOf(".")).toLowerCase() : "";
+        const skipExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".zip", ".tar", ".gz", ".lock", ".sum"]);
+        if (skipExts.has(ext)) continue;
+        if (name.toLowerCase().includes(query)) {
+          results.push({ relativePath: relPath, absolutePath: absPath });
+        }
+      }
+    }
+  }
+
+  /**
    * POST /api/open-in-editor/:path  -- open a file in the given editor.
    * Reads `editor` from the JSON body (defaults to "code").
    *
@@ -732,6 +806,7 @@ ${cssContent}
 </head>
 <body>
 <div id="app"><div id="pi-review-app"></div></div>
+<script>window.PI_REVIEW_CWD = ${JSON.stringify(this.cwd)};</script>
 <script>
 ${jsContent}
 </script>

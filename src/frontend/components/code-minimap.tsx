@@ -3,10 +3,10 @@
  * Renders actual code text scaled to fit. Shows viewport overlay.
  * Click to jump to that region.
  *
- * Must be placed inside .diff-scroll with absolute positioning.
+ * Place as a sibling of .diff-scroll inside .file-body-with-minimap.
  */
 
-import { JSX } from "preact";
+import { JSX, type RefObject } from "preact";
 import { useRef, useEffect, useState, useCallback } from "preact/hooks";
 
 // ---------------------------------------------------------------------------
@@ -21,6 +21,8 @@ export interface MinimapLine {
 
 export interface CodeMinimapProps {
   lines: MinimapLine[];
+  /** Scroll container for the file body; falls back to nearest .diff-scroll. */
+  scrollRef?: RefObject<HTMLElement>;
 }
 
 // ---------------------------------------------------------------------------
@@ -36,7 +38,7 @@ const FONT_FAMILY = '"SF Mono", "Fira Code", Menlo, monospace';
 // Component
 // ---------------------------------------------------------------------------
 
-export function CodeMinimap({ lines }: CodeMinimapProps): JSX.Element {
+export function CodeMinimap({ lines, scrollRef }: CodeMinimapProps): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ startY: number; startScrollTop: number } | null>(null);
@@ -49,17 +51,21 @@ export function CodeMinimap({ lines }: CodeMinimapProps): JSX.Element {
   const [containerHeight, setContainerHeight] = useState(300);
   const [scrollParent, setScrollParent] = useState<HTMLElement | null>(null);
 
+  const resolveScrollParent = useCallback((): HTMLElement | null => {
+    if (scrollRef?.current) return scrollRef.current;
+    const container = containerRef.current;
+    if (!container) return null;
+    const body = container.closest(".file-body-with-minimap");
+    return body?.querySelector<HTMLElement>(".diff-scroll") ?? null;
+  }, [scrollRef]);
+
   useEffect(() => {
     const container = containerRef.current;
     const canvas = canvasRef.current;
     if (!container) return;
 
-    // Find .diff-scroll sibling (we're inside .file-body-with-minimap)
-    const body = container.closest(".file-body-with-minimap");
-    const parent = body?.querySelector<HTMLElement>(".diff-scroll") ?? null;
-    setScrollParent(parent);
+    setScrollParent(resolveScrollParent());
 
-    // Size canvas to match container
     const updateSize = () => {
       const h = container.clientHeight;
       setContainerHeight(Math.max(20, h));
@@ -72,7 +78,7 @@ export function CodeMinimap({ lines }: CodeMinimapProps): JSX.Element {
     const observer = new ResizeObserver(updateSize);
     observer.observe(container);
     return () => observer.disconnect();
-  }, []);
+  }, [resolveScrollParent, lineCount]);
 
   // Draw code text onto canvas
   const draw = useCallback(() => {
@@ -157,8 +163,9 @@ export function CodeMinimap({ lines }: CodeMinimapProps): JSX.Element {
   const [viewportHeight, setViewportHeight] = useState(0);
 
   useEffect(() => {
-    const parent = scrollParent;
+    const parent = scrollParent ?? resolveScrollParent();
     if (!parent) return;
+    if (!scrollParent) setScrollParent(parent);
 
     const update = () => {
       const { scrollTop, scrollHeight, clientHeight } = parent;
@@ -173,9 +180,19 @@ export function CodeMinimap({ lines }: CodeMinimapProps): JSX.Element {
     };
 
     parent.addEventListener("scroll", update, { passive: true });
+    const resizeObserver = new ResizeObserver(update);
+    resizeObserver.observe(parent);
+    for (const child of parent.children) {
+      resizeObserver.observe(child);
+    }
     update();
-    return () => parent.removeEventListener("scroll", update);
-  }, [scrollParent, containerHeight]);
+    requestAnimationFrame(update);
+
+    return () => {
+      parent.removeEventListener("scroll", update);
+      resizeObserver.disconnect();
+    };
+  }, [scrollParent, containerHeight, lineCount, resolveScrollParent]);
 
   // Mouse down → start drag or click
   const handleMouseDown = useCallback((e: MouseEvent) => {
@@ -183,7 +200,6 @@ export function CodeMinimap({ lines }: CodeMinimapProps): JSX.Element {
     if (!parent) return;
     e.preventDefault();
 
-    const rect = (e.target as HTMLElement).getBoundingClientRect();
     dragRef.current = {
       startY: e.clientY,
       startScrollTop: parent.scrollTop,

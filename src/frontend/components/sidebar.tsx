@@ -563,9 +563,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           </>
         )}
       </div>
-      {/* Hide conversation button when there's no data */}
-      {(fileDiffs.length > 0 || history.length > 0 || externalChanges.length > 0) && (
-        <div class="sidebar-footer">
+      {/* Always show conversation button */}
+      <div class="sidebar-footer">
           <button
             class={`sidebar-conversation-toggle${conversationOpen ? " conv-active" : ""}`}
             title={conversationOpen ? "Hide conversation" : "Show conversation"}
@@ -580,7 +579,6 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             )}
           </button>
         </div>
-      )}
     </div>
   );
 }

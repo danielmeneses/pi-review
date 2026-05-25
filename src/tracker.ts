@@ -1468,10 +1468,14 @@ export class ChangeTracker {
   // Events
   // ------------------------------------------------------------------
 
-  /** Emit an update event so the server can broadcast to SSE clients. */
   private emitUpdate(): void {
     this.saveToDisk();
     this.pi.events.emit("pi-review:update", this.getState());
+  }
+
+  /** Flush state to disk. Call before process exit/reload. */
+  flushDisk(): void {
+    this.saveToDisk();
   }
 
   // ------------------------------------------------------------------

@@ -43,6 +43,8 @@ import { Sidebar } from "./components/sidebar.js";
 import { FileViewer } from "./components/file-viewer.js";
 import { ReferencePanel, type SelectedLines, type ConversationMessage } from "./components/reference-panel.js";
 import { ChatPanel, type ChatMessage } from "./components/chat-panel.js";
+import { FilesPane } from "./components/files-pane.js";
+import { SearchedFileView } from "./components/searched-file-view.js";
 import type { SelectedLineInfo } from "./selection.js";
 
 // ---------------------------------------------------------------------------
@@ -98,6 +100,14 @@ export function App(): JSX.Element {
   const [refResponse, setRefResponse] = useState<string | null>(null);
   const [refSending, setRefSending] = useState(false);
   const [conversationOpen, setConversationOpen] = useState(false);
+
+  // -- Files pane state --
+  const [filesPaneFiles, setFilesPaneFiles] = useState<Array<{ relativePath: string; absolutePath: string }>>([]);
+  const [filesPaneOpen, setFilesPaneOpen] = useState(false);
+  const [selectedSearchedFile, setSelectedSearchedFile] = useState<string | null>(null);
+  const [searchedFileContent, setSearchedFileContent] = useState<string | null>(null);
+  const [searchedFileLoading, setSearchedFileLoading] = useState(false);
+  const [filesPaneWidth, setFilesPaneWidth] = useState<number>(280);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatDraft, setChatDraft] = useState("");
@@ -199,7 +209,9 @@ export function App(): JSX.Element {
 
   // When fileDiffs change and full-file view is open, re-fetch content
   // so the merge always uses fresh data (avoids stale cache after deletions).
+  // Skip when a searched file is active (SearchedFileView handles its own content).
   useEffect(() => {
+    if (selectedSearchedFile) return;
     for (const filePath of Object.keys(fullFileView)) {
       if (fullFileView[filePath]) {
         apiGetFileContent(filePath).then((content) => {
@@ -211,8 +223,9 @@ export function App(): JSX.Element {
 
   // When the selected path changes, fetch file content if not already cached.
   // Also fetch for external-only files (not in fileDiffs but in externalChanges).
+  // Skip when a searched file is active (SearchedFileView handles its own content).
   useEffect(() => {
-    if (!selectedPath) return;
+    if (selectedSearchedFile || !selectedPath) return;
     const hasAgentChanges = fileDiffs.some(f => f.filePath === selectedPath);
     const hasExternalChanges = externalChanges.some(ec => ec.filePath === selectedPath);
     // Always fetch if we have external changes for this file (may be external-only)
@@ -320,12 +333,16 @@ export function App(): JSX.Element {
   const handleSelectFile = useCallback((filePath: string) => {
     setSelectedPath(filePath);
     setSelectedCycleId(null);
+    setSelectedSearchedFile(null);
+    setSearchedFileContent(null);
   }, []);
 
   /** Select a history cycle from the sidebar. */
   const handleSelectCycle = useCallback((cycleId: string, filePath: string) => {
     setSelectedPath(filePath);
     setSelectedCycleId(cycleId);
+    setSelectedSearchedFile(null);
+    setSearchedFileContent(null);
   }, []);
 
   /** Toggle collapse state for a file's history. */
@@ -650,16 +667,17 @@ export function App(): JSX.Element {
 
   /** Toggle the conversation panel open/closed. */
   const handleToggleConversation = useCallback(() => {
-    setConversationOpen((prev) => {
-      const next = !prev;
-      if (!next) return next;
-
+    if (conversationOpen) {
+      setConversationOpen(false);
+      return;
+    }
+    // Opening — set up reference if none exists
+    if (!refSelection) {
       if (lastSelectionRef.current) {
         setRefSelection(lastSelectionRef.current);
       } else if (selectedPath) {
         const diff = fileDiffs.find(f => f.filePath === selectedPath);
         if (diff) {
-          // Reference the file without sending full content
           const sel: SelectedLines = {
             filePath: selectedPath,
             relativePath: diff.relativePath,
@@ -670,14 +688,78 @@ export function App(): JSX.Element {
           lastSelectionRef.current = sel;
           setRefSelection(sel);
         }
+      } else if (selectedSearchedFile) {
+        const entry = filesPaneFiles.find((f) => f.relativePath === selectedSearchedFile);
+        if (entry) {
+          const sel: SelectedLines = {
+            filePath: entry.absolutePath,
+            relativePath: selectedSearchedFile,
+            startLine: 0,
+            endLine: 0,
+            code: "",
+          };
+          lastSelectionRef.current = sel;
+          setRefSelection(sel);
+        }
       }
-      return next;
-    });
-  }, [selectedPath, fileContents, fileDiffs]);
+    }
+    setConversationOpen(true);
+  }, [conversationOpen, refSelection, selectedPath, fileDiffs, selectedSearchedFile, filesPaneFiles]);
 
   /** Close the reference panel (from the ✕ button inside the panel). */
   const handleRefClose = useCallback(() => {
+    setRefSelection(null);
     setConversationOpen(false);
+  }, []);
+
+  // -----------------------------------------------------------------------
+  // Files pane handlers
+  // -----------------------------------------------------------------------
+
+  const handleSelectSearchedFile = useCallback(async (relativePath: string, absolutePath: string) => {
+    // Add to files list if not already present
+    setFilesPaneFiles(prev => {
+      const exists = prev.some(f => f.relativePath === relativePath);
+      return exists ? prev : [...prev, { relativePath, absolutePath }];
+    });
+    setSelectedSearchedFile(relativePath);
+    setSearchedFileContent(null);
+    setSearchedFileLoading(true);
+
+    // Fetch file content (SearchedFileView manages its own display)
+    try {
+      const content = await apiGetFileContent(absolutePath);
+      setSearchedFileContent(content);
+      setFileContents(prev => ({ ...prev, [absolutePath]: content }));
+    } catch {
+      setSearchedFileContent(null);
+    } finally {
+      setSearchedFileLoading(false);
+    }
+  }, []);
+
+  const handleRemoveSearchedFile = useCallback((relativePath: string) => {
+    setFilesPaneFiles(prev => {
+      const next = prev.filter(f => f.relativePath !== relativePath);
+      // Close pane if no files left
+      if (next.length === 0) setFilesPaneOpen(false);
+      return next;
+    });
+    if (selectedSearchedFile === relativePath) {
+      setSelectedSearchedFile(null);
+      setSearchedFileContent(null);
+    }
+  }, [selectedSearchedFile]);
+
+  const handleClearSearchedFiles = useCallback(() => {
+    setFilesPaneFiles([]);
+    setSelectedSearchedFile(null);
+    setSearchedFileContent(null);
+    setFilesPaneOpen(false);
+  }, []);
+
+  const handleToggleFilesPane = useCallback(() => {
+    setFilesPaneOpen(prev => !prev);
   }, []);
 
   // -----------------------------------------------------------------------
@@ -738,12 +820,16 @@ export function App(): JSX.Element {
   // Check if we should show the main empty state
   const hasNoData = fileDiffs.length === 0 && history.length === 0 && externalChanges.length === 0 && !fetchError;
 
+  const selectedSearchedFileEntry = selectedSearchedFile
+    ? filesPaneFiles.find((f) => f.relativePath === selectedSearchedFile) ?? null
+    : null;
+
   // -----------------------------------------------------------------------
   // Render
   // -----------------------------------------------------------------------
 
   return (
-    <>
+    <div id="pi-review-root">
       <Header
         pending={pending}
         commentCount={commentCount}
@@ -752,7 +838,8 @@ export function App(): JSX.Element {
         onSendComments={handleSendComments}
         onClearComments={handleClearAllComments}
         onOpenChat={handleToggleChat}
-        onRefresh={refresh}
+        onSearch={handleToggleFilesPane}
+        filesCount={filesPaneFiles.length}
       />
 
       <div
@@ -785,6 +872,7 @@ export function App(): JSX.Element {
         {/* Resize handle between sidebar and main */}
         <div
           class="resize-handle"
+          style="margin-right:0"
           onMouseDown={(e: MouseEvent) => {
             e.preventDefault();
             const sidebar = (e.target as HTMLElement).parentElement?.querySelector(".sidebar") as HTMLElement;
@@ -818,7 +906,28 @@ export function App(): JSX.Element {
         />
 
         <div class="main" id="main-area">
-          {hasNoData ? (
+          {selectedSearchedFile ? (
+            searchedFileLoading ? (
+              <div class="main-empty"><p>Loading file...</p></div>
+            ) : searchedFileContent && selectedSearchedFileEntry ? (
+              <SearchedFileView
+                relativePath={selectedSearchedFile}
+                absolutePath={selectedSearchedFileEntry.absolutePath}
+                content={searchedFileContent}
+                lineComments={lineComments}
+                editingComment={editingComment}
+                editingCommentDraft={editingCommentDraft}
+                onStartEditComment={handleStartEditComment}
+                onSaveComment={handleSaveComment}
+                onCancelComment={handleCancelComment}
+                onRemoveComment={handleRemoveComment}
+                onDraftChange={setEditingCommentDraft}
+                onReference={handleReference}
+              />
+            ) : (
+              <div class="main-empty"><p>Could not load file</p></div>
+            )
+          ) : hasNoData ? (
             <div class="main-empty">
               <div>
                 <h2>No tracked changes</h2>
@@ -847,7 +956,7 @@ export function App(): JSX.Element {
               onReference={handleReference}
             />
           )}
-          {conversationOpen && refSelection && (
+          {refSelection && (
             <ReferencePanel
               selection={refSelection}
               messages={refMessages}
@@ -864,6 +973,51 @@ export function App(): JSX.Element {
             />
           )}
         </div>
+
+        {/* Resize handle between main and files pane */}
+        {filesPaneOpen && (
+          <div
+            class="resize-handle"
+            onMouseDown={(e: MouseEvent) => {
+              e.preventDefault();
+              const pane = (e.target as HTMLElement).parentElement?.querySelector(".files-pane") as HTMLElement;
+              if (!pane) return;
+              const currentWidth = pane.offsetWidth;
+              const startX = e.clientX;
+              (e.target as HTMLElement).classList.add("active");
+
+              const onMouseMove = (ev: MouseEvent) => {
+                const delta = startX - ev.clientX;
+                const newWidth = Math.max(220, Math.min(500, currentWidth + delta));
+                setFilesPaneWidth(newWidth);
+              };
+
+              const onMouseUp = () => {
+                document.removeEventListener("mousemove", onMouseMove);
+                document.removeEventListener("mouseup", onMouseUp);
+                document.querySelectorAll(".resize-handle").forEach(h => h.classList.remove("active"));
+                document.body.style.cursor = "";
+                document.body.style.userSelect = "";
+              };
+
+              document.addEventListener("mousemove", onMouseMove);
+              document.addEventListener("mouseup", onMouseUp);
+              document.body.style.cursor = "col-resize";
+              document.body.style.userSelect = "none";
+            }}
+          />
+        )}
+
+        <FilesPane
+          files={filesPaneFiles}
+          selectedFile={selectedSearchedFile}
+          open={filesPaneOpen}
+          onSelectFile={handleSelectSearchedFile}
+          onRemoveFile={handleRemoveSearchedFile}
+          onClearAll={handleClearSearchedFiles}
+          onToggle={handleToggleFilesPane}
+          width={filesPaneWidth}
+        />
       </div>
 
       {/* SSE status indicator */}
@@ -891,6 +1045,6 @@ export function App(): JSX.Element {
         onClose={handleCloseChat}
         onClear={handleClearChat}
       />
-    </>
+    </div>
   );
 }

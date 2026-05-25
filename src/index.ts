@@ -71,6 +71,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
+    tracker.flushDisk();
     server.stop();
     port = undefined;
   });
