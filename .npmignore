@@ -1,0 +1,12 @@
+.claude
+.gitignore
+.githooks
+.pi
+e2e
+node_modules
+plans
+tests
+build.mjs
+PLAN.md
+playwright.config.ts
+tsconfig.json

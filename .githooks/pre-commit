@@ -1,7 +1,0 @@
-#!/bin/sh
-# Ensure dist/ is up to date before committing.
-# dist/ is gitignored — this hook only makes sure npm pack/publish gets fresh artifacts.
-
-echo "[pre-commit] building frontend…"
-npm run build:frontend
-echo "[pre-commit] frontend built → dist/"
